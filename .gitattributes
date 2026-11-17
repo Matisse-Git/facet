@@ -1,0 +1,7 @@
+# Rust sources are LF everywhere.
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+
+# Golden fixtures are byte-exact captures of git output; never normalize them.
+*.bin binary

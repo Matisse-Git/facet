@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = ["crates/facet-git", "crates/facet"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "UNLICENSED"
+publish = false
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "sync", "time", "macros", "fs"] }
+tokio-util = "0.7"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# Everyday optimized build: what `cargo run --release` and all profiling use.
+[profile.release]
+opt-level = 3
+lto = "thin"
+panic = "abort"
+strip = true
+
+# Shipping build (M4 installer / single exe): `cargo build --profile dist -p facet`.
+# Fat LTO takes ~10 minutes, so it is kept out of the everyday loop.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
