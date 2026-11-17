@@ -61,6 +61,10 @@ pub mod icon {
     pub const ERROR: char = '\u{E783}';
     pub const INFO: char = '\u{E946}';
     pub const CHEVRON_DOWN: char = '\u{E70D}';
+    pub const REMOVE: char = '\u{E738}';
+    pub const UNDO: char = '\u{E7A7}';
+    pub const CHECK: char = '\u{E73E}';
+    pub const DOCUMENT: char = '\u{E8A5}';
 }
 
 const FAMILY_SEMIBOLD: &str = "facet-semibold";
@@ -135,6 +139,14 @@ pub struct Palette {
     /// Dim layer behind modal-ish overlays (command palette).
     pub scrim: Color32,
     pub shadow: Color32,
+    /// Diff: row tint of added / removed lines, and the stronger tint of the words that
+    /// changed inside them.
+    pub diff_added: Color32,
+    pub diff_added_strong: Color32,
+    pub diff_removed: Color32,
+    pub diff_removed_strong: Color32,
+    /// Diff: hunk header row.
+    pub diff_hunk: Color32,
 }
 
 /// Straight-alpha color to egui's premultiplied `Color32`, usable in `const`.
@@ -165,6 +177,11 @@ pub const DARK: Palette = Palette {
     skeleton_highlight: rgba(255, 255, 255, 30),
     scrim: rgba(0, 0, 0, 96),
     shadow: rgba(0, 0, 0, 110),
+    diff_added: rgba(0x30, 0xD1, 0x58, 34),
+    diff_added_strong: rgba(0x30, 0xD1, 0x58, 92),
+    diff_removed: rgba(0xFF, 0x45, 0x3A, 38),
+    diff_removed_strong: rgba(0xFF, 0x45, 0x3A, 104),
+    diff_hunk: rgba(0x0A, 0x84, 0xFF, 28),
 };
 
 pub const LIGHT: Palette = Palette {
@@ -187,6 +204,11 @@ pub const LIGHT: Palette = Palette {
     skeleton_highlight: rgba(0, 0, 0, 28),
     scrim: rgba(0, 0, 0, 46),
     shadow: rgba(0, 0, 0, 50),
+    diff_added: rgba(0x1F, 0x9D, 0x45, 30),
+    diff_added_strong: rgba(0x1F, 0x9D, 0x45, 80),
+    diff_removed: rgba(0xD7, 0x2C, 0x22, 26),
+    diff_removed_strong: rgba(0xD7, 0x2C, 0x22, 72),
+    diff_hunk: rgba(0x00, 0x6F, 0xE6, 18),
 };
 
 impl Palette {

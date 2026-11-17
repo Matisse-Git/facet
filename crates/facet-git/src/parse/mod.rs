@@ -4,9 +4,13 @@
 //! real git live in `tests/golden/`). Parsers never see human-readable porcelain.
 
 mod commit;
+mod diff;
+mod status;
 mod version;
 
 pub use commit::{parse_commit_summary, CommitSummary, COMMIT_SUMMARY_FORMAT};
+pub use diff::{parse_file_diff, DiffLine, FileDiff, Hunk, LineKind};
+pub use status::{parse_status, BranchInfo, Change, EntryKind, Status, StatusEntry};
 pub use version::{parse_version, GitVersion};
 
 use crate::GitError;

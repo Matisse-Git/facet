@@ -95,6 +95,72 @@ impl TestRepo {
         std::fs::write(path, contents).expect("write file");
     }
 
+    pub fn write_bytes(&self, relative: &str, contents: &[u8]) {
+        let path = self.path.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent dirs");
+        }
+        std::fs::write(path, contents).expect("write file");
+    }
+
+    pub fn read(&self, relative: &str) -> String {
+        std::fs::read_to_string(self.path.join(relative)).expect("read file")
+    }
+
+    pub fn exists(&self, relative: &str) -> bool {
+        self.path.join(relative).exists()
+    }
+
+    pub fn remove(&self, relative: &str) {
+        std::fs::remove_file(self.path.join(relative)).expect("remove file");
+    }
+
+    /// The content of `path` as it is staged in the index.
+    pub async fn staged(&self, path: &str) -> String {
+        String::from_utf8(self.git_ok(&["show", &format!(":{path}")]).await).expect("utf-8")
+    }
+
+    pub async fn status(&self) -> facet_git::parse::Status {
+        facet_git::status(&self.git, &self.path, false, None)
+            .await
+            .expect("status")
+    }
+
+    pub async fn diff(
+        &self,
+        path: &str,
+        source: facet_git::DiffSource,
+    ) -> facet_git::parse::FileDiff {
+        let request = facet_git::DiffRequest {
+            path: path.to_owned(),
+            orig_path: None,
+            source,
+        };
+        facet_git::diff_file(&self.git, &self.path, &request, None)
+            .await
+            .expect("diff")
+    }
+
+    pub fn info(&self) -> facet_git::RepoInfo {
+        facet_git::RepoInfo {
+            git_dir: self.path.join(".git"),
+            workdir: Some(self.path.clone()),
+        }
+    }
+
+    /// Install a hook script (run by Git for Windows' bundled `sh`).
+    pub fn hook(&self, name: &str, script: &str) {
+        let path = self.path.join(".git").join("hooks").join(name);
+        std::fs::create_dir_all(path.parent().expect("hooks dir")).expect("create hooks dir");
+        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).expect("write hook");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod hook");
+        }
+    }
+
     /// Write a file, stage everything and commit with `message`.
     pub async fn commit_file(&self, relative: &str, contents: &str, message: &str) {
         self.write(relative, contents);

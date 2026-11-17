@@ -4,8 +4,12 @@
 //! Layout is computed by hand from rectangles rather than egui panels so that every edge sits
 //! exactly on the design grid and the chrome regions can stay transparent over Mica.
 
+mod changes;
 mod command_log;
+pub mod confirm;
 mod content;
+mod diff;
+mod image_diff;
 pub mod palette;
 mod sidebar;
 mod titlebar;
@@ -24,7 +28,7 @@ use crate::theme::{self, motion, radius, space, Palette, TITLE_BAR_HEIGHT};
 /// Minimum height kept for the content area when the command log is resized.
 const MIN_CONTENT_HEIGHT: f32 = 160.0;
 /// Width of the invisible grab area around a splitter.
-const SPLITTER_GRAB: f32 = 6.0;
+pub(super) const SPLITTER_GRAB: f32 = 6.0;
 
 /// Build a child `Ui` confined (and clipped) to `rect`, laid out top-down.
 pub fn region<R>(
@@ -193,6 +197,7 @@ impl FacetApp {
         self.drop_overlay(ui, content);
         self.toast_layer(ui, content);
         self.palette_layer(ui, window);
+        self.confirm_layer(ui, window);
     }
 
     /// Highlight the content area while files are dragged over the window.
@@ -231,7 +236,7 @@ impl FacetApp {
 }
 
 /// Shared hover/drag behavior for splitters: resize cursor plus an accent line.
-fn splitter_feedback(
+pub(super) fn splitter_feedback(
     ui: &Ui,
     response: &egui::Response,
     cursor: CursorIcon,

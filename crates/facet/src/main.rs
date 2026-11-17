@@ -7,13 +7,20 @@
 
 mod actions;
 mod app;
+mod app_work;
+mod filekind;
 mod format;
 mod fuzzy;
+mod highlight;
 mod icon;
+mod loader;
 mod platform;
 mod settings;
+mod textdiff;
 mod theme;
 mod ui;
+mod watcher;
+mod workspace;
 
 use std::path::PathBuf;
 use std::sync::Arc;

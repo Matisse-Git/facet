@@ -19,6 +19,13 @@ const LINE_HEIGHT: f32 = 24.0;
 
 impl FacetApp {
     pub(super) fn content(&mut self, ui: &mut Ui, rect: Rect) {
+        let working_copy = self.active_tab().is_some_and(
+            |tab| matches!(&tab.state, TabState::Ready { info, .. } if !info.is_bare()),
+        );
+        if working_copy {
+            self.work_view(ui, rect);
+            return;
+        }
         let mut actions = Vec::new();
         match self.active_tab().map(|tab| &tab.state) {
             None => welcome(ui, rect, &mut actions),

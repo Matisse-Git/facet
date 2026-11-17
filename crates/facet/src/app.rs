@@ -13,12 +13,16 @@ use eframe::egui;
 use facet_git::parse::GitVersion;
 use facet_git::{CancellationToken, CommandLog, CommandRecord, Git, GitError, Head, RepoInfo};
 
-use crate::actions::{Action, Command, CommandContext, GLOBAL_SHORTCUTS};
+use crate::actions::{shortcut, Action, Command, CommandContext, WorkContext, GLOBAL_SHORTCUTS};
+use crate::app_work::WorkEvent;
 use crate::platform::{self, Chrome};
 use crate::settings::{same_path, Settings};
 use crate::theme::{self, Palette};
+use crate::ui::confirm::Confirm;
 use crate::ui::palette::PaletteState;
 use crate::ui::toast::{Toast, ToastKind};
+use crate::watcher::{IndexStamp, RepoWatcher};
+use crate::workspace::{Area, DiffBody, Workspace};
 
 /// How long settings changes settle before being written to disk.
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(800);
@@ -33,6 +37,13 @@ pub enum Event {
         result: Result<(RepoInfo, Head), GitError>,
     },
     SettingsSaved(Result<(), String>),
+    /// Working copy results for one tab (see `app_work.rs`). `stamp` is the state of
+    /// `.git/index` right after work that may have written it.
+    Work {
+        tab: u64,
+        stamp: Option<IndexStamp>,
+        event: WorkEvent,
+    },
 }
 
 pub enum TabState {
@@ -53,6 +64,14 @@ pub struct RepoTab {
     load: Option<CancellationToken>,
     /// Reopened from the previous session rather than by the user; does not count as "recent".
     restored: bool,
+    /// Status, selection, diff, commit draft and undo stack (unused for bare repositories).
+    pub work: Workspace,
+    /// Keeps the file system watch alive while the tab is open.
+    pub(crate) watcher: Option<RepoWatcher>,
+    /// Serializes this repository's index-changing git operations.
+    pub(crate) ops: Arc<tokio::sync::Mutex<()>>,
+    /// `.git/index` as Facet last left it, to tell its own writes from outside changes.
+    pub(crate) index_stamp: IndexStamp,
 }
 
 impl RepoTab {
@@ -85,14 +104,14 @@ pub struct FacetApp {
     settings_dirty_since: Option<Instant>,
     save_in_flight: bool,
 
-    runtime: tokio::runtime::Runtime,
-    git: Git,
+    pub(crate) runtime: tokio::runtime::Runtime,
+    pub(crate) git: Git,
     pub command_log: Arc<CommandLog>,
     /// Snapshot of the command log for the panel, rebuilt only when the log's revision changes.
     pub log_view: (u64, Vec<CommandRecord>),
-    events_tx: Sender<Event>,
+    pub(crate) events_tx: Sender<Event>,
     events_rx: Receiver<Event>,
-    ctx: egui::Context,
+    pub(crate) ctx: egui::Context,
 
     pub tabs: Vec<RepoTab>,
     pub active: Option<usize>,
@@ -102,6 +121,8 @@ pub struct FacetApp {
     pub palette: PaletteState,
     pub toasts: Vec<Toast>,
     next_toast_id: u64,
+    /// The question currently asked before a destructive action, if any.
+    pub confirm: Option<Confirm>,
     /// Actions queued by views during a frame; run after the frame's UI is built.
     pub pending: Vec<Action>,
 
@@ -160,6 +181,7 @@ impl FacetApp {
             palette: PaletteState::default(),
             toasts: Vec::new(),
             next_toast_id: 1,
+            confirm: None,
             pending: Vec::new(),
             chrome,
             applied_dark: Some(dark),
@@ -195,7 +217,7 @@ impl FacetApp {
     // ----- background plumbing -------------------------------------------------------------
 
     /// Run `future` on the tokio runtime and deliver its event to the UI thread.
-    fn spawn(&self, future: impl std::future::Future<Output = Event> + Send + 'static) {
+    pub(crate) fn spawn(&self, future: impl std::future::Future<Output = Event> + Send + 'static) {
         let tx = self.events_tx.clone();
         let ctx = self.ctx.clone();
         self.runtime.spawn(async move {
@@ -246,6 +268,7 @@ impl FacetApp {
                     self.error_toast("Couldn't save settings", Some(detail));
                 }
             }
+            Event::Work { tab, stamp, event } => self.handle_work_event(tab, stamp, event),
         }
     }
 
@@ -268,6 +291,10 @@ impl FacetApp {
             state: TabState::Loading,
             load: None,
             restored: !activate,
+            work: Workspace::default(),
+            watcher: None,
+            ops: Arc::default(),
+            index_stamp: None,
         });
         let index = self.tabs.len() - 1;
         if activate || self.active.is_none() {
@@ -359,13 +386,18 @@ impl FacetApp {
                     }
                     return;
                 }
-                if !self.tabs[index].is_ready() && !self.tabs[index].restored {
+                let first_load = !self.tabs[index].is_ready();
+                if first_load && !self.tabs[index].restored {
                     self.settings.touch_recent(&root);
                 }
                 let tab = &mut self.tabs[index];
                 tab.path = root;
                 tab.state = TabState::Ready { info, head };
                 tab.load = None;
+                if first_load {
+                    // Status, the file watcher and everything else about the working copy.
+                    self.start_workspace(index);
+                }
             }
             Err(GitError::Cancelled) => {}
             Err(error) => {
@@ -390,6 +422,9 @@ impl FacetApp {
         let tab = self.tabs.remove(index);
         if let Some(load) = tab.load {
             load.cancel();
+        }
+        if let Some(diff) = tab.work.diff.cancel {
+            diff.cancel();
         }
         self.active = match self.active {
             _ if self.tabs.is_empty() => None,
@@ -424,15 +459,43 @@ impl FacetApp {
     /// The commands available right now (for the palette).
     pub fn commands(&self) -> Vec<Command> {
         let names: Vec<String> = self.tabs.iter().map(RepoTab::name).collect();
+        let work = self.work_context();
         crate::actions::commands(&CommandContext {
             tabs: &names,
             active_tab: self.active,
             repo_ready: self.active_tab().is_some_and(RepoTab::is_ready),
+            work: work.as_ref(),
             recent: &self.settings.recent_repos,
             theme: self.settings.theme,
             sidebar_visible: self.settings.sidebar_visible,
             command_log_visible: self.settings.command_log_visible,
             command_log_empty: self.command_log.is_empty(),
+        })
+    }
+
+    /// What the working copy commands depend on (none without a working tree).
+    fn work_context(&self) -> Option<WorkContext> {
+        let work = self.active_work()?;
+        let text = work.diff.text();
+        Some(WorkContext {
+            staged: work.staged.len(),
+            unstaged: work.unstaged.len(),
+            selection: Some((work.selection.area, work.selection.items.len())),
+            has_current: work.current().is_some(),
+            diff_area: work.diff.key.as_ref().map(|key| key.area),
+            hunks: text
+                .filter(|text| text.partial)
+                .map_or(0, |text| text.diff.hunks.len()),
+            selected_lines: text.map_or(0, |text| text.selected.len()),
+            can_commit: self.can_commit(),
+            can_amend: work.branch.oid.is_some() && !work.commit.running,
+            amend: work.commit.amend,
+            undo: work
+                .last_undo()
+                .map(|entry| (entry.label.clone(), entry.redo)),
+            perf: work.perf.config,
+            image_mode: matches!(work.diff.body, DiffBody::Image(_))
+                .then_some(self.settings.image_mode),
         })
     }
 
@@ -458,7 +521,12 @@ impl FacetApp {
             }
             Action::Refresh => {
                 if let Some(index) = self.active {
-                    self.load_tab(index);
+                    if self.active_work().is_some() {
+                        // An explicit refresh may take git's optional locks.
+                        self.request_status(index, true);
+                    } else {
+                        self.load_tab(index);
+                    }
                 }
             }
             Action::RevealInExplorer => {
@@ -490,6 +558,11 @@ impl FacetApp {
                 theme::set_mode(&self.ctx, mode);
             }
             Action::Quit => self.ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            // Everything else belongs to the working copy (`app_work.rs`).
+            work => {
+                let unhandled = self.run_work_action(work);
+                debug_assert!(unhandled.is_none(), "unhandled action {unhandled:?}");
+            }
         }
     }
 
@@ -526,6 +599,20 @@ impl FacetApp {
         self.push_toast(ToastKind::Error, title.into(), detail);
     }
 
+    /// A toast with a button (used for "Undo" after a discard).
+    pub fn action_toast(&mut self, title: impl Into<String>, button: &str, action: Action) {
+        // Only the newest offer stays valid: an older "Undo" would act on the wrong entry.
+        for toast in &mut self.toasts {
+            if toast.action.is_some() {
+                toast.dismiss();
+            }
+        }
+        self.push_toast(ToastKind::Info, title.into(), None);
+        if let Some(toast) = self.toasts.last_mut() {
+            toast.action = Some((button.to_owned(), action));
+        }
+    }
+
     fn push_toast(&mut self, kind: ToastKind, title: String, detail: Option<String>) {
         let id = self.next_toast_id;
         self.next_toast_id += 1;
@@ -546,10 +633,16 @@ impl FacetApp {
             if let Some(chrome) = self.chrome {
                 chrome.set_dark(dark);
             }
+            // Syntax colors are made for one appearance.
+            self.redecorate_all();
         }
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        // A confirmation dialog owns the keyboard entirely (it handles Enter and Escape).
+        if self.confirm.is_some() {
+            return;
+        }
         for (shortcut, action) in GLOBAL_SHORTCUTS {
             if ctx.input_mut(|input| input.consume_shortcut(shortcut)) {
                 // While the palette is open it owns the keyboard, except its own toggle.
@@ -558,6 +651,78 @@ impl FacetApp {
                 }
             }
         }
+        self.handle_work_keys(ctx);
+    }
+
+    /// Keys of the file list and the diff. They apply while no widget has keyboard focus, so
+    /// typing a commit message or tabbing through buttons never stages or discards anything.
+    fn handle_work_keys(&mut self, ctx: &egui::Context) {
+        if self.palette.open || ctx.memory(|memory| memory.focused().is_some()) {
+            return;
+        }
+        let Some(work) = self.active_work() else {
+            return;
+        };
+        let lines_selected = work
+            .diff
+            .text()
+            .is_some_and(|text| !text.selected.is_empty());
+        let diff_area = work.diff.key.as_ref().map(|key| key.area);
+
+        let mut actions = Vec::new();
+        ctx.input_mut(|input| {
+            // Most specific first: shortcuts match logically (Shift+Down also matches Down).
+            if input.consume_shortcut(&shortcut::UNDO) {
+                actions.push(Action::UndoDiscard);
+            }
+            if input.consume_shortcut(&shortcut::SELECT_ALL) {
+                actions.push(Action::SelectAllFiles);
+            }
+            if input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown) {
+                actions.push(Action::ExtendFileSelection(1));
+            }
+            if input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp) {
+                actions.push(Action::ExtendFileSelection(-1));
+            }
+            if input.consume_shortcut(&shortcut::NEXT_FILE) {
+                actions.push(Action::SelectNextFile);
+            }
+            if input.consume_shortcut(&shortcut::PREVIOUS_FILE) {
+                actions.push(Action::SelectPreviousFile);
+            }
+            // With lines selected in the diff, Enter / Delete / Escape act on those lines;
+            // otherwise on the selected files.
+            let toggle = input.consume_shortcut(&shortcut::TOGGLE_STAGE)
+                || input.consume_key(egui::Modifiers::NONE, egui::Key::Space);
+            if toggle {
+                actions.push(match (lines_selected, diff_area) {
+                    (true, Some(Area::Unstaged)) => Action::StageLines,
+                    (true, Some(Area::Staged)) => Action::UnstageLines,
+                    _ => Action::ToggleStageSelected,
+                });
+            }
+            if input.consume_shortcut(&shortcut::DISCARD) {
+                actions.push(if lines_selected {
+                    Action::DiscardLines
+                } else {
+                    Action::DiscardSelected
+                });
+            }
+            if lines_selected {
+                if input.consume_shortcut(&shortcut::CLEAR_LINES) {
+                    actions.push(Action::ClearLineSelection);
+                }
+                // The OS delivers Ctrl+C as a copy event, not as a key press.
+                if input
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::Copy))
+                {
+                    actions.push(Action::CopySelectedLines);
+                }
+            }
+        });
+        self.pending.extend(actions);
     }
 
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
@@ -574,13 +739,17 @@ impl FacetApp {
         }
     }
 
-    /// Returning to the window is the cheapest moment to notice outside changes (a checkout in
-    /// a terminal, say) until the filesystem watcher lands with status in M1.
+    /// Returning to the window refreshes the active repository: a safety net under the file
+    /// watcher (which can miss events on network drives or when the OS buffer overflows).
     fn refresh_on_focus(&mut self, ctx: &egui::Context) {
         let focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
         if focused && !self.was_focused {
             if let Some(index) = self.active.filter(|i| self.tabs[*i].is_ready()) {
-                self.load_tab(index);
+                if self.active_work().is_some() {
+                    self.request_status(index, false);
+                } else {
+                    self.load_tab(index);
+                }
             }
         }
         self.was_focused = focused;
@@ -693,6 +862,9 @@ impl eframe::App for FacetApp {
             if let Some(load) = &tab.load {
                 load.cancel();
             }
+            if let Some(diff) = &tab.work.diff.cancel {
+                diff.cancel();
+            }
         }
         self.capture_window_placement();
         if self.settings != self.saved_settings || self.settings_dirty_since.is_some() {
@@ -702,7 +874,7 @@ impl eframe::App for FacetApp {
 }
 
 /// Turn a git error into a toast: a plain-language title plus git's own words as detail.
-fn describe_error(error: &GitError) -> (String, Option<String>) {
+pub(crate) fn describe_error(error: &GitError) -> (String, Option<String>) {
     match error {
         GitError::NotARepository { path, detail } => (
             format!("“{}” is not a Git repository", display_name(path)),

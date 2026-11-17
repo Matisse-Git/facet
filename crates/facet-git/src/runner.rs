@@ -80,6 +80,7 @@ impl Git {
             cancel: None,
             stdin: None,
             optional_locks: true,
+            log_stdout: false,
         }
     }
 }
@@ -112,6 +113,7 @@ pub struct GitCommand {
     cancel: Option<CancellationToken>,
     stdin: Option<Vec<u8>>,
     optional_locks: bool,
+    log_stdout: bool,
 }
 
 impl GitCommand {
@@ -152,6 +154,13 @@ impl GitCommand {
     /// takes `index.lock` and can't collide with a git command the user runs in a terminal.
     pub fn background(mut self) -> Self {
         self.optional_locks = false;
+        self
+    }
+
+    /// Record stdout as well as stderr in the command log. For commands whose stdout is meant
+    /// for people (hook output during `commit`), never for commands whose stdout is data.
+    pub fn log_stdout(mut self) -> Self {
+        self.log_stdout = true;
         self
     }
 
@@ -310,12 +319,26 @@ impl GitCommand {
             }
         };
 
-        log.finish(
-            id,
-            CommandOutcome::Exited(status),
-            started.elapsed(),
-            &stderr,
-        );
+        if self.log_stdout && !stdout.is_empty() {
+            let mut combined = stdout.clone();
+            if !combined.ends_with(b"\n") {
+                combined.push(b'\n');
+            }
+            combined.extend_from_slice(&stderr);
+            log.finish(
+                id,
+                CommandOutcome::Exited(status),
+                started.elapsed(),
+                &combined,
+            );
+        } else {
+            log.finish(
+                id,
+                CommandOutcome::Exited(status),
+                started.elapsed(),
+                &stderr,
+            );
+        }
         Ok(GitOutput {
             status,
             stdout,

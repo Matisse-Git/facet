@@ -216,6 +216,25 @@ pub async fn head(git: &Git, repo_root: &Path) -> Result<Head, GitError> {
     }
 }
 
+/// The one-line summary of the commit at `HEAD`. Only call this when `HEAD` resolves to a
+/// commit (status reports that): on an unborn branch `git log` fails by design.
+pub async fn commit_summary(git: &Git, repo_root: &Path) -> Result<CommitSummary, GitError> {
+    let output = git
+        .command([
+            "log",
+            "-1",
+            "-z",
+            "--no-show-signature",
+            COMMIT_SUMMARY_FORMAT,
+            "HEAD",
+        ])
+        .current_dir(repo_root)
+        .background()
+        .run()
+        .await?;
+    parse_commit_summary(&output.stdout)
+}
+
 fn parse_bool(command: &'static str, value: &str) -> Result<bool, GitError> {
     match value {
         "true" => Ok(true),

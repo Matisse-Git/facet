@@ -1,0 +1,15 @@
+[package]
+name = "facet-bench"
+description = "Benchmark repository generator and performance measurements for Facet."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+facet-git = { path = "../facet-git" }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

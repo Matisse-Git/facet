@@ -32,6 +32,10 @@ pub enum GitError {
     #[error("cancelled")]
     Cancelled,
 
+    /// The request is valid but Facet cannot carry it out (explained in plain language).
+    #[error("{0}")]
+    Unsupported(String),
+
     #[error("i/o error while talking to git: {0}")]
     Io(#[from] std::io::Error),
 

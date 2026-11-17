@@ -8,7 +8,8 @@ use eframe::egui::{
     TextFormat, Ui, Vec2,
 };
 
-use super::widgets::icon_button_at;
+use super::widgets::{icon_button_at, text_button_at, text_button_width};
+use crate::actions::Action;
 use crate::app::FacetApp;
 use crate::theme::{self, icon, motion, radius, space, Palette};
 
@@ -26,6 +27,8 @@ pub struct Toast {
     pub kind: ToastKind,
     pub title: String,
     pub detail: Option<String>,
+    /// An optional button: its label and what it does ("Undo").
+    pub action: Option<(String, Action)>,
     created: Instant,
     dismissed: bool,
 }
@@ -37,13 +40,20 @@ impl Toast {
             kind,
             title,
             detail,
+            action: None,
             created: Instant::now(),
             dismissed: false,
         }
     }
 
+    pub fn dismiss(&mut self) {
+        self.dismissed = true;
+    }
+
     fn lifetime(&self) -> Duration {
         match self.kind {
+            // An offer needs time to be read and reached.
+            ToastKind::Info if self.action.is_some() => Duration::from_secs(8),
             ToastKind::Info => Duration::from_millis(3500),
             ToastKind::Error => Duration::from_secs(12),
         }
@@ -67,15 +77,20 @@ impl FacetApp {
         let palette = Palette::of(&ctx);
         let width = MAX_WIDTH.min(content.width() - space::XL);
         let text_left_inset = space::M + 16.0 + space::S;
-        let text_width = width - text_left_inset - space::S - 28.0 - space::S;
 
         let mut bottom = content.bottom() - space::L;
         let mut finished: Vec<u64> = Vec::new();
         let mut dismiss: Vec<u64> = Vec::new();
+        let mut invoked: Vec<Action> = Vec::new();
 
         // Newest toast sits at the bottom of the stack.
         for toast in self.toasts.iter().rev() {
             let remaining = toast.remaining();
+            let action_width = toast
+                .action
+                .as_ref()
+                .map_or(0.0, |(label, _)| text_button_width(ui, label) + space::S);
+            let text_width = width - text_left_inset - space::S - 28.0 - space::S - action_width;
             let visible = ctx.animate_bool_with_time_and_easing(
                 Id::unique(("toast-visible", toast.id)),
                 remaining.is_some(),
@@ -187,9 +202,31 @@ impl FacetApp {
                     {
                         dismiss.push(toast.id);
                     }
+
+                    if let Some((label, action)) = &toast.action {
+                        let button = Rect::from_min_size(
+                            Pos2::new(close.left() - action_width, close.center().y - 12.0),
+                            Vec2::new(action_width - space::S, 24.0),
+                        );
+                        if text_button_at(
+                            ui,
+                            button,
+                            Id::unique(("toast-action", toast.id)),
+                            label,
+                            "",
+                            palette.accent,
+                            false,
+                        )
+                        .clicked()
+                        {
+                            invoked.push(action.clone());
+                            dismiss.push(toast.id);
+                        }
+                    }
                 });
         }
 
+        self.pending.extend(invoked);
         for toast in &mut self.toasts {
             if dismiss.contains(&toast.id) {
                 toast.dismissed = true;

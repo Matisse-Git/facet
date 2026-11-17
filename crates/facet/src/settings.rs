@@ -18,6 +18,30 @@ const MAX_RECENT: usize = 12;
 
 pub const SIDEBAR_WIDTH: std::ops::RangeInclusive<f32> = 176.0..=480.0;
 pub const COMMAND_LOG_HEIGHT: std::ops::RangeInclusive<f32> = 96.0..=640.0;
+pub const CHANGES_WIDTH: std::ops::RangeInclusive<f32> = 240.0..=720.0;
+pub const COMMIT_BOX_HEIGHT: std::ops::RangeInclusive<f32> = 104.0..=480.0;
+
+/// How two versions of an image are compared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ImageMode {
+    #[default]
+    SideBySide,
+    Swipe,
+    OnionSkin,
+}
+
+impl ImageMode {
+    pub const ALL: [Self; 3] = [Self::SideBySide, Self::Swipe, Self::OnionSkin];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SideBySide => "Side by Side",
+            Self::Swipe => "Swipe",
+            Self::OnionSkin => "Onion Skin",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -49,6 +73,14 @@ pub struct Settings {
     pub sidebar_width: f32,
     pub command_log_visible: bool,
     pub command_log_height: f32,
+    /// Width of the file list between the sidebar and the diff.
+    pub changes_width: f32,
+    /// Height of the commit message area under the file list.
+    pub commit_box_height: f32,
+    pub image_mode: ImageMode,
+    /// Repositories where the offer to enable `core.fsmonitor` / `core.untrackedCache` was
+    /// declined; it is not shown there again.
+    pub perf_offer_declined: Vec<PathBuf>,
     /// Most recently opened first.
     pub recent_repos: Vec<PathBuf>,
     /// Repositories open in tabs when the app was last closed, in tab order.
@@ -65,6 +97,10 @@ impl Default for Settings {
             sidebar_width: 240.0,
             command_log_visible: false,
             command_log_height: 200.0,
+            changes_width: 340.0,
+            commit_box_height: 148.0,
+            image_mode: ImageMode::default(),
+            perf_offer_declined: Vec::new(),
             recent_repos: Vec::new(),
             open_repos: Vec::new(),
             active_repo: None,
@@ -95,7 +131,8 @@ impl Settings {
         let Ok(text) = std::fs::read_to_string(&path) else {
             return Self::default();
         };
-        match serde_json::from_str::<Self>(&text) {
+        // Editors like Notepad may save a byte order mark; JSON parsers reject it.
+        match serde_json::from_str::<Self>(text.trim_start_matches('\u{feff}')) {
             Ok(mut settings) => {
                 settings.sanitize();
                 settings
@@ -127,6 +164,8 @@ impl Settings {
     fn sanitize(&mut self) {
         self.sidebar_width = clamp_or(self.sidebar_width, SIDEBAR_WIDTH, 240.0);
         self.command_log_height = clamp_or(self.command_log_height, COMMAND_LOG_HEIGHT, 200.0);
+        self.changes_width = clamp_or(self.changes_width, CHANGES_WIDTH, 340.0);
+        self.commit_box_height = clamp_or(self.commit_box_height, COMMIT_BOX_HEIGHT, 148.0);
         self.recent_repos.truncate(MAX_RECENT);
         if self
             .active_repo

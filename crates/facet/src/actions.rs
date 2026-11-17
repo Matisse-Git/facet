@@ -7,8 +7,10 @@
 use std::path::PathBuf;
 
 use eframe::egui::{Key, KeyboardShortcut, Modifiers};
+use facet_git::{DiscardFile, PerfConfig};
 
-use crate::settings::ThemeMode;
+use crate::settings::{ImageMode, ThemeMode};
+use crate::workspace::Area;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
@@ -27,9 +29,71 @@ pub enum Action {
     ToggleSidebar,
     ToggleCommandLog,
     ClearCommandLog,
-    CopyText { text: String, what: &'static str },
+    CopyText {
+        text: String,
+        what: &'static str,
+    },
     SetTheme(ThemeMode),
     Quit,
+
+    // ----- working copy: file list ---------------------------------------------------------
+    /// A click on a file row (`toggle`: Ctrl, `extend`: Shift).
+    SelectFile {
+        area: Area,
+        index: usize,
+        toggle: bool,
+        extend: bool,
+    },
+    SelectNextFile,
+    SelectPreviousFile,
+    /// Shift+Arrow: grow the selection by one row up (-1) or down (1).
+    ExtendFileSelection(isize),
+    SelectAllFiles,
+    StageSelected,
+    UnstageSelected,
+    /// Stage the selection if it is in "Changes", unstage it if it is in "Staged".
+    ToggleStageSelected,
+    StagePaths(Vec<String>),
+    UnstagePaths(Vec<String>),
+    StageAll,
+    UnstageAll,
+    /// Discards ask for confirmation first; the `Confirmed…` variants do the work.
+    DiscardSelected,
+    DiscardAll,
+    DiscardPath(String),
+    ConfirmedDiscardFiles {
+        files: Vec<DiscardFile>,
+        label: String,
+    },
+    ConfirmedDiscardPatch {
+        patch: Vec<u8>,
+        label: String,
+    },
+    /// Undo the latest discard (or redo it, right after an undo).
+    UndoDiscard,
+
+    // ----- working copy: diff --------------------------------------------------------------
+    StageHunk(usize),
+    UnstageHunk(usize),
+    DiscardHunk(usize),
+    StageLines,
+    UnstageLines,
+    DiscardLines,
+    ClearLineSelection,
+    CopySelectedLines,
+    CopyFilePath,
+    SetImageMode(ImageMode),
+
+    // ----- working copy: commit ------------------------------------------------------------
+    Commit,
+    ToggleAmend,
+    FocusCommitMessage,
+    DismissCommitError,
+
+    // ----- per-repository performance settings ---------------------------------------------
+    EnablePerf,
+    DisablePerf,
+    DeclinePerfOffer,
 }
 
 pub mod shortcut {
@@ -47,6 +111,23 @@ pub mod shortcut {
     pub const COPY_PATH: KeyboardShortcut = KeyboardShortcut::new(CTRL_SHIFT, Key::C);
     pub const SIDEBAR: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::B);
     pub const COMMAND_LOG: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::Backtick);
+
+    pub const COMMIT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::Enter);
+    pub const FOCUS_MESSAGE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::M);
+    pub const STAGE_ALL: KeyboardShortcut = KeyboardShortcut::new(CTRL_SHIFT, Key::A);
+    pub const UNSTAGE_ALL: KeyboardShortcut = KeyboardShortcut::new(CTRL_SHIFT, Key::U);
+
+    // The shortcuts below belong to the file list and the diff: they apply while no text
+    // field or button has keyboard focus (see `FacetApp::handle_work_keys`).
+    pub const UNDO: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::Z);
+    pub const SELECT_ALL: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::A);
+    pub const TOGGLE_STAGE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::Enter);
+    pub const DISCARD: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::Delete);
+    pub const NEXT_FILE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::ArrowDown);
+    pub const PREVIOUS_FILE: KeyboardShortcut =
+        KeyboardShortcut::new(Modifiers::NONE, Key::ArrowUp);
+    pub const CLEAR_LINES: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::Escape);
+    pub const COPY: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::C);
 }
 
 /// One entry in the command palette.
@@ -57,6 +138,30 @@ pub struct Command {
     pub action: Action,
 }
 
+/// The state of the active repository's working copy, as far as commands depend on it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WorkContext {
+    pub staged: usize,
+    pub unstaged: usize,
+    /// Where the file selection is, and how many files it holds.
+    pub selection: Option<(Area, usize)>,
+    /// A file is shown in the diff pane.
+    pub has_current: bool,
+    /// Which list the shown diff belongs to.
+    pub diff_area: Option<Area>,
+    /// Hunks of the shown diff that can be staged / unstaged / discarded on their own.
+    pub hunks: usize,
+    pub selected_lines: usize,
+    pub can_commit: bool,
+    pub can_amend: bool,
+    pub amend: bool,
+    /// The latest discard: its label, and whether invoking it redoes rather than undoes.
+    pub undo: Option<(String, bool)>,
+    pub perf: Option<PerfConfig>,
+    /// An image comparison is on screen (and in which mode).
+    pub image_mode: Option<ImageMode>,
+}
+
 /// What the command list depends on.
 pub struct CommandContext<'a> {
     /// Display names of the open tabs, in order.
@@ -64,12 +169,17 @@ pub struct CommandContext<'a> {
     pub active_tab: Option<usize>,
     /// The active tab has finished loading.
     pub repo_ready: bool,
+    /// The active repository's working copy (none for bare repositories).
+    pub work: Option<&'a WorkContext>,
     pub recent: &'a [PathBuf],
     pub theme: ThemeMode,
     pub sidebar_visible: bool,
     pub command_log_visible: bool,
     pub command_log_empty: bool,
 }
+
+/// Palette entries are listed for at most this many hunks of a diff.
+const MAX_HUNK_COMMANDS: usize = 30;
 
 /// All commands available right now, in palette order. Commands that cannot run in the current
 /// state are left out rather than shown disabled.
@@ -88,6 +198,10 @@ pub fn commands(cx: &CommandContext<'_>) -> Vec<Command> {
         Some(shortcut::OPEN),
         Action::OpenRepository,
     );
+
+    if let Some(work) = cx.work {
+        work_commands(work, &mut add);
+    }
 
     if cx.repo_ready {
         add("Refresh".into(), Some(shortcut::REFRESH), Action::Refresh);
@@ -179,6 +293,206 @@ pub fn commands(cx: &CommandContext<'_>) -> Vec<Command> {
     list
 }
 
+fn work_commands(
+    work: &WorkContext,
+    add: &mut impl FnMut(String, Option<KeyboardShortcut>, Action),
+) {
+    if work.can_commit {
+        add(
+            if work.amend {
+                "Amend Last Commit"
+            } else {
+                "Commit"
+            }
+            .into(),
+            Some(shortcut::COMMIT),
+            Action::Commit,
+        );
+    }
+    add(
+        "Write Commit Message".into(),
+        Some(shortcut::FOCUS_MESSAGE),
+        Action::FocusCommitMessage,
+    );
+    if work.can_amend {
+        add(
+            if work.amend {
+                "Commit: Stop Amending"
+            } else {
+                "Commit: Amend Last Commit"
+            }
+            .into(),
+            None,
+            Action::ToggleAmend,
+        );
+    }
+
+    if work.unstaged > 0 {
+        add(
+            "Stage All Changes".into(),
+            Some(shortcut::STAGE_ALL),
+            Action::StageAll,
+        );
+    }
+    if work.staged > 0 {
+        add(
+            "Unstage All Changes".into(),
+            Some(shortcut::UNSTAGE_ALL),
+            Action::UnstageAll,
+        );
+    }
+    match work.selection {
+        Some((Area::Unstaged, count)) if count > 0 => {
+            add(
+                format!("Stage {}", selected_files(count)),
+                Some(shortcut::TOGGLE_STAGE),
+                Action::StageSelected,
+            );
+            add(
+                format!("Discard {}…", selected_files(count)),
+                Some(shortcut::DISCARD),
+                Action::DiscardSelected,
+            );
+        }
+        Some((Area::Staged, count)) if count > 0 => add(
+            format!("Unstage {}", selected_files(count)),
+            Some(shortcut::TOGGLE_STAGE),
+            Action::UnstageSelected,
+        ),
+        _ => {}
+    }
+    if work.unstaged > 0 {
+        add("Discard All Changes…".into(), None, Action::DiscardAll);
+    }
+    if let Some((label, redo)) = &work.undo {
+        add(
+            if *redo {
+                format!("Redo Discard: {label}")
+            } else {
+                format!("Undo Discard: {label}")
+            },
+            Some(shortcut::UNDO),
+            Action::UndoDiscard,
+        );
+    }
+
+    // Lines and hunks of the diff on screen.
+    if work.selected_lines > 0 {
+        let lines = if work.selected_lines == 1 {
+            "Selected Line".to_owned()
+        } else {
+            format!("{} Selected Lines", work.selected_lines)
+        };
+        match work.diff_area {
+            Some(Area::Unstaged) => {
+                add(
+                    format!("Stage {lines}"),
+                    Some(shortcut::TOGGLE_STAGE),
+                    Action::StageLines,
+                );
+                add(
+                    format!("Discard {lines}…"),
+                    Some(shortcut::DISCARD),
+                    Action::DiscardLines,
+                );
+            }
+            Some(Area::Staged) => add(
+                format!("Unstage {lines}"),
+                Some(shortcut::TOGGLE_STAGE),
+                Action::UnstageLines,
+            ),
+            None => {}
+        }
+        add(
+            format!("Copy {lines}"),
+            Some(shortcut::COPY),
+            Action::CopySelectedLines,
+        );
+        add(
+            "Clear Line Selection".into(),
+            Some(shortcut::CLEAR_LINES),
+            Action::ClearLineSelection,
+        );
+    }
+    for hunk in 0..work.hunks.min(MAX_HUNK_COMMANDS) {
+        let number = hunk + 1;
+        match work.diff_area {
+            Some(Area::Unstaged) => {
+                add(
+                    format!("Stage Hunk {number}"),
+                    None,
+                    Action::StageHunk(hunk),
+                );
+                add(
+                    format!("Discard Hunk {number}…"),
+                    None,
+                    Action::DiscardHunk(hunk),
+                );
+            }
+            Some(Area::Staged) => add(
+                format!("Unstage Hunk {number}"),
+                None,
+                Action::UnstageHunk(hunk),
+            ),
+            None => {}
+        }
+    }
+
+    if work.staged + work.unstaged > 0 {
+        add(
+            "Select Next File".into(),
+            Some(shortcut::NEXT_FILE),
+            Action::SelectNextFile,
+        );
+        add(
+            "Select Previous File".into(),
+            Some(shortcut::PREVIOUS_FILE),
+            Action::SelectPreviousFile,
+        );
+        add(
+            "Select All Files in List".into(),
+            Some(shortcut::SELECT_ALL),
+            Action::SelectAllFiles,
+        );
+    }
+    if work.has_current {
+        add("Copy File Path".into(), None, Action::CopyFilePath);
+    }
+    if let Some(current) = work.image_mode {
+        for mode in ImageMode::ALL {
+            if mode != current {
+                add(
+                    format!("Image Diff: {}", mode.label()),
+                    None,
+                    Action::SetImageMode(mode),
+                );
+            }
+        }
+    }
+
+    match work.perf {
+        Some(config) if config.all_enabled() => add(
+            "Repository: Disable File System Monitor and Untracked Cache".into(),
+            None,
+            Action::DisablePerf,
+        ),
+        Some(_) => add(
+            "Repository: Enable File System Monitor and Untracked Cache".into(),
+            None,
+            Action::EnablePerf,
+        ),
+        None => {}
+    }
+}
+
+fn selected_files(count: usize) -> String {
+    if count == 1 {
+        "Selected File".to_owned()
+    } else {
+        format!("{count} Selected Files")
+    }
+}
+
 /// Global shortcuts, most specific first (egui matches shortcuts logically, so `Ctrl+Shift+Tab`
 /// must be tested before `Ctrl+Tab`).
 pub const GLOBAL_SHORTCUTS: &[(KeyboardShortcut, Action)] = &[
@@ -186,6 +500,10 @@ pub const GLOBAL_SHORTCUTS: &[(KeyboardShortcut, Action)] = &[
     (shortcut::NEXT_TAB, Action::NextTab),
     (shortcut::REVEAL, Action::RevealInExplorer),
     (shortcut::COPY_PATH, Action::CopyRepositoryPath),
+    (shortcut::STAGE_ALL, Action::StageAll),
+    (shortcut::UNSTAGE_ALL, Action::UnstageAll),
+    (shortcut::COMMIT, Action::Commit),
+    (shortcut::FOCUS_MESSAGE, Action::FocusCommitMessage),
     (shortcut::PALETTE, Action::ShowPalette),
     (shortcut::OPEN, Action::OpenRepository),
     (shortcut::CLOSE_TAB, Action::CloseActiveTab),
@@ -203,11 +521,31 @@ mod tests {
             tabs,
             active_tab: if tabs.is_empty() { None } else { Some(0) },
             repo_ready: !tabs.is_empty(),
+            work: None,
             recent,
             theme: ThemeMode::System,
             sidebar_visible: true,
             command_log_visible: false,
             command_log_empty: true,
+        }
+    }
+
+    /// A working copy with something to do for every command.
+    fn busy_work() -> WorkContext {
+        WorkContext {
+            staged: 2,
+            unstaged: 3,
+            selection: Some((Area::Unstaged, 2)),
+            has_current: true,
+            diff_area: Some(Area::Unstaged),
+            hunks: 2,
+            selected_lines: 3,
+            can_commit: true,
+            can_amend: true,
+            amend: false,
+            undo: Some(("notes.txt".into(), false)),
+            perf: Some(PerfConfig::default()),
+            image_mode: Some(ImageMode::SideBySide),
         }
     }
 
@@ -225,6 +563,8 @@ mod tests {
         assert!(!titles.contains(&"Close Tab"));
         assert!(!titles.contains(&"Next Tab"));
         assert!(!titles.contains(&"Clear Command Log"));
+        assert!(!titles.contains(&"Commit"));
+        assert!(!titles.contains(&"Write Commit Message"));
     }
 
     #[test]
@@ -269,9 +609,95 @@ mod tests {
     }
 
     #[test]
+    fn working_copy_commands_follow_the_state() {
+        let tabs = ["game".to_owned()];
+        let work = busy_work();
+        let mut cx = context(&tabs, &[]);
+        cx.work = Some(&work);
+        let list = commands(&cx);
+        let all = titles(&list);
+        for expected in [
+            "Commit",
+            "Write Commit Message",
+            "Commit: Amend Last Commit",
+            "Stage All Changes",
+            "Unstage All Changes",
+            "Stage 2 Selected Files",
+            "Discard 2 Selected Files…",
+            "Discard All Changes…",
+            "Undo Discard: notes.txt",
+            "Stage 3 Selected Lines",
+            "Discard 3 Selected Lines…",
+            "Copy 3 Selected Lines",
+            "Clear Line Selection",
+            "Stage Hunk 1",
+            "Discard Hunk 2…",
+            "Select Next File",
+            "Select All Files in List",
+            "Copy File Path",
+            "Image Diff: Swipe",
+            "Image Diff: Onion Skin",
+            "Repository: Enable File System Monitor and Untracked Cache",
+        ] {
+            assert!(all.contains(&expected), "missing {expected}");
+        }
+        assert!(!all.contains(&"Image Diff: Side by Side"));
+        assert!(!all.contains(&"Unstage Hunk 1"));
+
+        // The staged side offers the opposite operations and never a discard.
+        let staged = WorkContext {
+            selection: Some((Area::Staged, 1)),
+            diff_area: Some(Area::Staged),
+            selected_lines: 1,
+            amend: true,
+            undo: Some(("notes.txt".into(), true)),
+            perf: Some(PerfConfig {
+                fsmonitor: true,
+                untracked_cache: true,
+            }),
+            image_mode: None,
+            ..busy_work()
+        };
+        cx.work = Some(&staged);
+        let list = commands(&cx);
+        let all = titles(&list);
+        for expected in [
+            "Amend Last Commit",
+            "Commit: Stop Amending",
+            "Unstage Selected File",
+            "Unstage Selected Line",
+            "Unstage Hunk 2",
+            "Redo Discard: notes.txt",
+            "Repository: Disable File System Monitor and Untracked Cache",
+        ] {
+            assert!(all.contains(&expected), "missing {expected}");
+        }
+        assert!(!all.iter().any(|title| title.starts_with("Discard Hunk")));
+        assert!(!all.iter().any(|title| title.starts_with("Image Diff")));
+
+        // A clean working copy offers none of it.
+        let clean = WorkContext::default();
+        cx.work = Some(&clean);
+        let list = commands(&cx);
+        let all = titles(&list);
+        assert!(all.contains(&"Write Commit Message"));
+        for absent in [
+            "Commit",
+            "Stage All Changes",
+            "Select Next File",
+            "Copy File Path",
+        ] {
+            assert!(!all.contains(&absent), "unexpected {absent}");
+        }
+    }
+
+    #[test]
     fn every_global_shortcut_is_reachable_from_the_palette() {
         let tabs = ["a".to_owned(), "b".to_owned()];
-        let list = commands(&context(&tabs, &[]));
+        let work = busy_work();
+        let mut cx = context(&tabs, &[]);
+        cx.work = Some(&work);
+        let list = commands(&cx);
         for (shortcut, action) in GLOBAL_SHORTCUTS {
             if *action == Action::ShowPalette {
                 continue; // the palette does not list itself

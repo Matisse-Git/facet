@@ -8,13 +8,13 @@ sessions: status, decisions, module map, gotchas, next steps. Keep it current.
 | # | Scope | Status |
 | --- | --- | --- |
 | M0 | Scaffold, docs, theme system, Mica window, repo open dialog, command palette shell | **done** (2026-11-17) |
-| M1 | Status, staging (file/hunk/line), text + image diffs, commit/amend, discard + undo | **next** |
-| M2 | Commit graph, branches, remotes, stash | not started |
+| M1 | Status, staging (file/hunk/line), text + image diffs, commit/amend, discard + undo | **done** (2026-11-17) |
+| M2 | Commit graph, branches, remotes, stash | **next** |
 | M3 | Interactive rebase, conflicts, blame, search, reflog/undo | not started |
 | M4 | LFS + locking, submodules, worktrees, settings, perf pass, MSIX + single-exe release | not started |
 
-The project folder is **not yet a git repository** — no `git init` / commit has been made by a
-session (commits are the user's call).
+The project is a git repository; M0 was committed by the user as `fd06660` on `master`. Sessions
+never commit — they suggest a commit message (commits are the user's call).
 
 ## Build, run, test
 
@@ -26,7 +26,16 @@ cargo clippy --workspace --all-targets -- -D warnings     # must be clean
 cargo fmt --all
 cargo build --release -p facet                            # thin LTO; use this for all profiling
 cargo build --profile dist -p facet                       # fat LTO, ~10.5 min; shipping only (M4)
+cargo run --release -p facet-bench -- generate            # benchmark repo -> target/bench-repo (~65 s)
+cargo run --release -p facet-bench -- measure --runs 10   # status / diff timings on it
 ```
+
+`facet-bench generate [--files N] [--commits N] [--force] [DIR]` (defaults 100 000 / 100 000 /
+`target/bench-repo`) builds the history with `git fast-import` and leaves a dirty tree (100 edits,
+5 deletions, 50 untracked files, a 10 MB text file with every 7th line changed).
+`facet-bench measure [--runs N] [--perf on|off] [DIR]` times status (first, warm foreground, warm
+background), status parsing, the 10 MB diff load and diff parsing; `--perf` sets
+`core.fsmonitor`/`core.untrackedCache` locally in the bench repo only.
 
 Requirements: Rust stable (built with 1.97.1), Git for Windows on `PATH` (tested with 2.45.1),
 Windows 11. Build times on the dev machine: debug incremental ~25 s, `release` ~4 min, `dist` ~10.5 min.
@@ -41,6 +50,7 @@ Diagnostic environment variables:
 | `FACET_STARTUP_LOG` | File to which `first frame presented after N ms on <GPU adapter>` is written. |
 | `WGPU_POWER_PREF` | `low` / `high` — override GPU adapter choice (see gotcha G4). |
 | `WGPU_BACKEND` | `dx12` (default) / `vulkan`. Vulkan works but loses Mica (no alpha swapchain). |
+| `FACET_PERF_LOG` | File to which status refresh / diff load / decorate timings are appended. |
 
 ## What M0 delivered
 
@@ -60,6 +70,34 @@ Diagnostic environment variables:
 - Inline non-modal error toasts; settings persisted atomically as JSON.
 - 69 tests: 33 unit in `facet`; in `facet-git` 13 unit (parsers, command log), 22 integration
   against temp repos (13 repo, 9 runner) and 1 golden fixture.
+
+## What M1 delivered
+
+- Work view for every non-bare tab: repo header · file list (Staged / Changes sections, conflicts flagged,
+  badges, split dir/name, skeleton while loading) · diff pane · commit box, with remembered splitters.
+- Status: `status --porcelain=v2 -z --branch --untracked-files=all` parser (ordinary, renamed/copied,
+  unmerged, untracked, ignored, submodule, branch headers incl. ahead/behind) + golden fixture.
+- FS watcher (`notify`): 150 ms quiet / 1 s max debounce, `.git` noise filtered, batches classified
+  as worktree / index / refs / overflow → targeted refresh (status always; the open diff only when
+  its path, its rename source or the index changed).
+- Text diff: `diff --no-ext-diff --no-color -z` parsed to hunks/lines; virtualized rows, sticky
+  line-number gutter, syntect highlighting + word-level intra-line emphasis computed off the UI
+  thread (20 k line budget), "line shortened" / "no newline at end of file" notes.
+- Staging: file, all, hunk and line (click / drag / hunk-header click selects lines); hunk and line
+  patches are generated (`patch.rs`) and applied with `git apply --cached` (unstage: `--reverse`).
+- Binary-aware: extension table (.uasset/.umap/.fbx/.psd/.blend/…) + git's binary detection →
+  metadata card with sizes and LFS-pointer detection; never a text diff.
+- Image diff (png/jpg/tga/bmp/webp, decoded off-thread, capped at 4096 px textures): side by side,
+  swipe, onion skin, checkerboard backdrop.
+- Commit / amend: message editor (Ctrl+M, Ctrl+Enter), amend toggle prefills the last message; a
+  failing commit (e.g. a rejecting hook) shows git's + the hook's output under the commit box, and
+  every run's output is in the command log; hooks never bypassed.
+- Discard (file / hunk / lines) with confirm dialog → content moved to `.git/facet/undo/<id>/` first
+  → undo toast + Ctrl+Z; store pruned to 50 entries / 7 days.
+- Per-repo opt-in offer for `core.fsmonitor` + `core.untrackedCache` after two consecutive refreshes
+  over 150 ms (written with `config --local` only after the user accepts).
+- `facet-bench` crate: benchmark repo generator + measurement tool.
+- 161 tests: facet 67 unit; facet-bench 2; facet-git 36 unit + 56 integration/golden.
 
 ## Architecture decisions (with rationale)
 
@@ -107,6 +145,31 @@ Diagnostic environment variables:
 14. **wgpu device uses `MemoryHints::MemoryUsage`** (`main.rs`). The default (`Performance`)
     pre-sizes large allocator blocks and cost ~300 MB of private memory for nothing; Facet's draw
     load is tiny. Adapter selection is left at eframe's default (see G4).
+15. **Foreground vs background status.** Watcher-triggered refreshes run `.background()`
+    (`GIT_OPTIONAL_LOCKS=0`, never takes `index.lock`); refreshes after Facet's own operations and
+    F5 run in the foreground so the index stat cache is refreshed. Every request carries a per-tab
+    **epoch**; results older than the newest request are dropped.
+16. **Facet ignores its own index writes.** After an operation the app records `.git/index`'s
+    `(mtime, len)` stamp; a watcher batch whose only news is that same stamp does not trigger
+    another refresh (no refresh loops).
+17. **Targeted diff reload (`WorkState::diff_stale`).** A status refresh never reloads the open diff
+    by itself; it is marked stale by a foreground request, a watcher batch touching its path / rename
+    source, or an index change. An identical reload keeps selection, colours and scroll.
+18. **Partial staging = generated patch + `git apply --cached`** on stdin (`--reverse` to unstage,
+    `git apply --reverse` on the worktree for partial discard). Partial staging is disabled for
+    renames, conflicts, submodules and binaries (file-level actions only), where a hand-built patch
+    could not be trusted.
+19. **Undo by moving, not by stash.** Discard copies the current content (or the reverse patch) into
+    `.git/facet/undo/<id>/` with a manifest *before* touching the working tree; undo restores it.
+    It works for untracked files (stash would need `-u` and touches everything) and is invisible to
+    other tools. Destructive actions go through `ui/confirm.rs` and always end with an undo toast.
+20. **Decorations are async and appearance-gated.** Syntax/emphasis spans are computed in
+    `spawn_blocking` with a cancellation token per diff; they are drawn only if computed for the
+    current dark/light palette, otherwise the plain text shows until the recompute lands.
+21. **Clipboard** goes through egui's `ctx.copy_text` (eframe's `clipboard` feature, arboard
+    underneath) — no direct `arboard` dependency.
+22. **Benchmarks live in their own crate** (`facet-bench`) and build history with `git fast-import`
+    (100k commits in ~40 s; per-commit `git commit` would take hours, G5).
 
 ## Module map
 
@@ -117,18 +180,39 @@ crates/facet-git/
   src/runner.rs               Git, GitCommand (builder), GitOutput; spawn/stream/cancel
   src/cmdlog.rs               CommandLog, CommandRecord, CommandOutcome
   src/error.rs                GitError
-  src/repo.rs                 RepoInfo, Head, version(), discover(), head()
+  src/repo.rs                 RepoInfo, Head, version(), discover(), head(), commit_summary()
+  src/status.rs               status() (fg/bg), PerfConfig, perf_config(), set_perf_config()
+  src/diff.rs                 DIFF_ARGS, diff_file(), read_blob(), object_sizes(), LFS pointers
+  src/patch.rs                build_patch(): hunk/line selection -> applyable patch
+  src/stage.rs                stage/unstage paths/all, apply_patch() (git apply --cached)
+  src/commit.rs               commit()/amend with hook output, last_commit_message()
+  src/discard.rs              discard_files(), discard_patch(), undo store, list/prune_undo()
   src/parse/mod.rs            shared helpers (utf8)
   src/parse/commit.rs         COMMIT_SUMMARY_FORMAT, CommitSummary, parse_commit_summary
+  src/parse/status.rs         porcelain v2 -z parser
+  src/parse/diff.rs           numstat + patch parser (files -> hunks -> lines)
   src/parse/version.rs        GitVersion, parse_version
   tests/common/mod.rs         TestRepo: isolated temp repo/bare repo, fixed identity + dates
   tests/repo.rs               discovery + HEAD integration tests
   tests/runner.rs             runner: streaming, stdin, cancel, logging, env
-  tests/golden.rs + golden/   parser golden fixtures
+  tests/status.rs             status: renames, unicode, spaces, conflicts, submodules, unborn
+  tests/staging.rs            file/hunk/line stage + unstage, CRLF, no-EOL, new/deleted, binary
+  tests/commit.rs             commit, amend, hooks (output surfaced, failure reported)
+  tests/discard.rs            discard file/hunk/lines + undo, untracked files, pruning
+  tests/golden.rs + golden/   parser golden fixtures (version, commit, status_v2, diff)
+crates/facet-bench/
+  src/main.rs                 generate (fast-import benchmark repo) + measure (status/diff timings)
 crates/facet/
   build.rs                    embeds the app manifest (PerMonitorV2, long paths, UTF-8)
   src/main.rs                 runtime, wgpu/DX12 setup, viewport, eframe launch
   src/app.rs                  FacetApp state, Event, RepoTab, action dispatch, persistence
+  src/app_work.rs             status/diff/stage/commit/discard/undo requests and their events
+  src/workspace.rs            per-tab WorkState: status, selection, open diff, line selection
+  src/loader.rs               off-thread diff/image/blob loading, image decode limits
+  src/watcher.rs              notify watcher, classify + debounce -> FsChange, index stamp
+  src/highlight.rs            syntect highlighting (off-thread), span model
+  src/textdiff.rs             word-level intra-line diff
+  src/filekind.rs             extension -> Text / Image / Binary(name)
   src/actions.rs              Action enum, shortcuts, palette command list
   src/settings.rs             Settings (JSON), ThemeMode, recents
   src/theme.rs                tokens, Palette DARK/LIGHT, fonts, egui style install
@@ -140,7 +224,11 @@ crates/facet/
   src/ui/widgets.rs           buttons, icon buttons, elided text, skeleton, hairlines, tooltips
   src/ui/titlebar.rs          sidebar toggle, repo tabs, + button, drag region registration
   src/ui/sidebar.rs           recent repositories, git version footer
-  src/ui/content.rs           welcome screen, repository overview, loading skeleton
+  src/ui/content.rs           welcome screen, bare-repo overview, loading skeleton
+  src/ui/changes.rs           work view layout, repo header, file list, perf offer, commit box
+  src/ui/diff.rs              diff pane: header actions, virtualized text diff, gutter, selection
+  src/ui/image_diff.rs        side by side / swipe / onion skin, checkerboard
+  src/ui/confirm.rs           modal confirm dialog for destructive actions
   src/ui/command_log.rs       command log panel
   src/ui/palette.rs           command palette
   src/ui/toast.rs             toasts
@@ -152,7 +240,7 @@ Features in SPEC §2–§4 that the milestone one-liners do not name explicitly:
 
 | Milestone | Also includes |
 | --- | --- |
-| M1 | FS watcher (`notify`, ~150 ms debounce → targeted refresh); syntax highlighting (`syntect`) + word-level intra-line diff; binary-aware handling (.uasset/.umap/.fbx/.psd/.blend → metadata, never text diff); lazy 10 MB diffs; clipboard via `arboard`; per-repo opt-in offer for `core.fsmonitor` / `core.untrackedCache`; **benchmark repo generator** (100k files / 100k commits) and the first real perf measurements (status refresh). |
+| M1 (done) | FS watcher (`notify`, ~150 ms debounce → targeted refresh); syntax highlighting (`syntect`) + word-level intra-line diff; binary-aware handling (.uasset/.umap/.fbx/.psd/.blend → metadata, never text diff); lazy 10 MB diffs; clipboard via `arboard`; per-repo opt-in offer for `core.fsmonitor` / `core.untrackedCache`; **benchmark repo generator** (100k files / 100k commits) and the first real perf measurements (status refresh). |
 | M2 | Tags; multiple remotes; fetch / pull (rebase or ff-only) / push (force-with-lease); credentials (askpass / GCM — see G7); process-tree kill via Job Objects (G6); partial stash; virtualized graph at 120 fps on the benchmark repo; Windows toast notifications for long operations; GitHub/GitLab/Azure DevOps link-outs. |
 | M3 | Cherry-pick, revert, reset; file history with rename following; search (message/author/file/pickaxe); per-extension external diff/merge tools (UnityYAMLMerge, P4Merge, Beyond Compare); auto-stash + reflog-based undo for destructive operations. |
 | M4 | Unity/Unreal `.gitignore` templates; open in Windows Terminal / VS Code / Rider; settings UI (theme, fonts, external tools, git path); sparse-checkout and partial-clone verification pass; embedded `.ico` + version resource; single-instance handling. |
@@ -163,6 +251,10 @@ Features in SPEC §2–§4 that the milestone one-liners do not name explicitly:
   `Id::new` is deprecated → `Id::unique`; `ui.id()` → `ui.scope_id()`; `DroppedFile::path()` is a
   method; `TextEdit::frame` takes a `Frame`; variable-font axes go through `FontTweak::coords`.
   Do not blanket-replace `::new(` — `FontId::new` and `LayerId::new` are still correct.
+  Learned in M1: `LayoutSection.byte_range` is `Range<ByteIndex>` (slice with `.start.0..end.0`);
+  with `TextEdit::frame(Frame::NONE)` the `.margin()` is ignored — use
+  `Frame::NONE.inner_margin(..)`; in `ScrollArea::show_viewport` `ui.max_rect().min` is the content
+  origin; repeating textures need `TextureOptions { wrap_mode: TextureWrapMode::Repeat, .. }`.
 - **G2 — `WM_ERASEBKGND` must paint black.** Without the black GDI fill (plus the
   `RedrawWindow(RDW_ERASE)` after install) the window is white instead of Mica and the caption
   buttons do not appear.
@@ -193,31 +285,44 @@ Features in SPEC §2–§4 that the milestone one-liners do not name explicitly:
   instance keeps the GPU busy for a moment — measure startup with one clean launch at a time.
 - **G12 — tooling.** Write source files with the editor tools, not shell heredocs (apostrophes in
   Rust break them silently). Fat LTO takes ~10.5 min — never use `--profile dist` in the edit loop.
+  Shell `sed` substitutions mangle escapes too: in M1 a sed edit turned the BOM char literal
+  (backslash-u-{feff}) into `'{feff}'`. Anything containing a backslash goes through Edit/Write.
+  Stop a running `facet.exe` before `cargo build --release` (the exe is locked).
 - **G13 — `git log` on an unborn branch fails by design**; `head()` ignores that failure. Any new
   caller must treat "no commits yet" as a state, not an error.
 - **G14 — session-restored tabs must not reorder the recent list** (`RepoTab::restored`); only
   user-initiated opens call `touch_recent`.
+- **G15 — settings JSON may start with a UTF-8 BOM** (Notepad, PowerShell 5.1 `Set-Content`/
+  `Out-File`). The loader strips it; without that the file was treated as corrupt and renamed.
+  Write test settings with `[IO.File]::WriteAllText` (no BOM).
+- **G16 — `core.fsmonitor` is not a free win.** On the dev machine (NVMe) warm status on the
+  100k-file bench repo was ~111 ms without it and ~146 ms with fsmonitor + untrackedCache. The
+  offer is shown only when measured refreshes exceed 150 ms, and is never applied without consent;
+  re-measure on slower disks before making it more prominent.
+- **G17 — never reload the diff on every status refresh.** A 10 MB diff costs ~260 ms and ~11 MB
+  per load; use `diff_stale` (decision 17). Facet's own index writes must not retrigger refreshes
+  (decision 16).
 
-## Known issues / deliberate limits after M0
+## Known issues / deliberate limits after M1
 
 - True cold start (first launch after a reboot) has not been measured; only warm-cache launches.
-- No file-system watcher yet: the overview refreshes on window focus and F5 only (watcher is M1).
+- Frame time while scrolling the 10 MB diff was not measured (no number, only an impression).
+- Light theme of the M1 views, onion-skin mode and drag-to-select lines were not visually verified
+  in the app (logic is unit-tested; dark theme, side by side, swipe and click-select were checked).
+- No keyboard scrolling in the diff (PgUp/PgDn/Home/End do nothing); arrow keys move between files.
+- The sidebar "Recent" list is empty when all tabs were session-restored (by design, G14).
 - No single-instance guard: two Facet windows share one `settings.json`; last writer wins.
-- An unborn branch shows one red (failed) `git log` row in the command log on each refresh. Honest,
-  but noisy; M1's status-based refresh should avoid running it when there is no HEAD commit.
-- Maximized window + auto-hide taskbar: the taskbar may not slide in (the classic custom-frame
-  issue); needs the `ABM_GETAUTOHIDEBAR` one-pixel inset in `WM_NCCALCSIZE`.
-- Many open tabs are squeezed, not scrolled; there is no overflow menu yet (the palette lists all
-  tabs, so every tab stays reachable).
-- The exe has no embedded `.ico`/version resource (the window/taskbar icon is set at runtime), so
-  Explorer shows the generic icon for `facet.exe`.
-- Bare repositories open and show the overview only.
-- The folder picker dialog and drag-and-drop compile and are wired to the same `open_path` code
-  path as the tested routes (`facet <path>`, recents, session restore), but were **not** exercised
-  end-to-end in the M0 session (automation could not hold keyboard focus while the machine was in
-  use). They are first on the manual checklist; fix before M1 work if either fails.
-- The benchmark repository generator does not exist yet, so no budget that depends on it (status
-  refresh, log scroll, large diffs) has been measured.
+- Maximized window + auto-hide taskbar: the taskbar may not slide in (needs the
+  `ABM_GETAUTOHIDEBAR` one-pixel inset in `WM_NCCALCSIZE`).
+- Many open tabs are squeezed, not scrolled; the palette lists all tabs.
+- The exe has no embedded `.ico`/version resource (M4).
+- Bare repositories show the overview only (no work view: there is no working tree).
+- Folder picker and drag-and-drop were never exercised end-to-end by automation (M0 note); still on
+  the manual checklist.
+- Partial (hunk/line) staging is unavailable for renamed, conflicted, submodule and binary entries;
+  conflicts can only be marked resolved (full conflict UI is M3).
+- Diffs beyond 20 000 lines show without syntax/word highlighting (plain text, still virtualized).
+- G6 still applies: cancelling kills `git.exe` but not hook children; commit hooks run to completion.
 
 ## Measurements
 
@@ -225,54 +330,54 @@ Dev machine: Windows 11 Home 26200, AMD integrated GPU + NVIDIA GT 1030, Git for
 Method: `FACET_STARTUP_LOG` for time to first presented frame; `Get-Process` CPU time / working
 set / private bytes sampled over a fixed idle window; one clean instance at a time.
 
-Final M0 `release` build (thin LTO, 11.5 MB exe), one repository tab restored, 1296×839 window,
-NVIDIA adapter on DX12:
+Benchmark repo (`facet-bench generate`): 100 000 commits, 100 001 files, 10 MB text file; generated
+in 65 s (fast-import 41.6 s, checkout 23.1 s). Dirty tree as described under Build.
+
+M1 `release` build, measured on the bench repo:
 
 | Budget (SPEC §2.4) | Measured | Verdict |
 | --- | --- | --- |
-| Cold start < 1 s | 842 / 887 ms to first presented frame (two launches, **warm disk cache**, while Unity shader compilers + Rider held the machine at 70–100 % CPU). Earlier on a quiet machine: 667 ms (fat-LTO build), 634 ms (debug). | Within budget warm. **True cold start (after reboot) not measured.** Startup is dominated by DX12 device + swapchain creation, not by Facet code. |
-| Idle RAM < 300 MB | 163 MB working set, 224 MB private bytes | Met for the M0 shell. Re-measure every milestone; diff/graph caches will add to it. |
-| Idle CPU (implied) | 0.13 s CPU over 20 s idle; 0.00 s over 5 s | Met — no repaint loop, no polling. |
-| Warm status refresh < 150 ms | — | Not measurable until M1 (no status yet, no benchmark repo). |
-| Log scroll 120 fps | — | Not measurable until M2. |
-| 10 MB diffs lazy | — | Not measurable until M1. |
+| Cold start < 1 s | 901 / 903 ms to first frame with the bench repo restored (warm cache, GT 1030). M0 shell: 842 / 887 ms. | Within budget warm. **True cold start not measured.** |
+| Warm status refresh < 150 ms | `facet-bench measure`: first 254 ms; warm foreground median 111 ms (108–118); warm background median 112 ms; parse < 1 ms (19 KB). In-app: first 141–143 ms, warm 118–126 ms. | **Met** (no fsmonitor). With fsmonitor + untrackedCache: ~146 ms (slower, G16). |
+| 10 MB diffs lazy | Load median 256 ms (11.6 MB, 159 997 lines; parse 6 ms) via `facet-bench`; in-app 255–296 ms off the UI thread, decorate 6–7 ms (beyond line budget, so plain). The UI keeps painting meanwhile (skeleton). | **Met**: UI thread never blocks; rows virtualized. Scroll frame time not measured. |
+| Idle RAM < 300 MB | File list only: 166 MB working set / 224 MB private. 10 MB diff open, 20 s idle: 188 MB / 253 MB. | Met. |
+| Idle CPU | 0.03 s CPU over 20 s idle with the 10 MB diff open. | Met: watcher is event-driven, no polling. |
+| Log scroll 120 fps | — | Not measurable until M2 (graph). |
+
+M0 numbers (same machine, for comparison): 842 / 887 ms first frame, 163 MB WS / 224 MB private,
+0.13 s CPU over 20 s idle.
 
 Supporting numbers:
 
-- One git process costs 50–90 ms wall time (see G5). Opening a repository = `rev-parse` ×2 then
-  three concurrent HEAD queries ≈ 200–250 ms until the overview is filled; the skeleton shows
-  meanwhile.
-- Memory history, same scenario: wgpu default memory hints 487 MB WS / 522 MB private →
-  `MemoryHints::MemoryUsage` 163 / 224 MB. Debug builds sit higher (333 / 387 MB).
+- One git process costs 50–90 ms wall time (see G5). Opening a repository = `rev-parse` x2 then
+  concurrent HEAD/status queries; the skeleton shows meanwhile.
+- Memory history: wgpu default memory hints 487 MB WS / 522 MB private -> `MemoryHints::MemoryUsage`
+  163 / 224 MB. Debug builds sit higher (333 / 387 MB).
 - Vulkan backend for comparison: 167 MB WS / 379 MB private, and no Mica.
 - Low-power adapter (AMD integrated, DX12): one thread at 100 % of a core while idle (G4).
-- Startup timings swing a lot with machine load (the same debug exe measured 634 ms quiet and
-  3.0–4.9 s under a Unity shader compile). Compare like with like and note the load.
+- Startup timings swing a lot with machine load. Compare like with like and note the load.
 
-## Next steps (M1)
+## Next steps (M2)
 
-Scope: status, staging (file/hunk/line), text + image diffs, commit/amend, discard + undo — plus the
-M1 row of "Where the remaining SPEC features land".
+Scope: commit graph, branches, remotes, stash — plus the M2 row of "Where the remaining SPEC
+features land" (tags, multiple remotes, fetch/pull/push, credentials, Job Objects, partial stash,
+120 fps graph on the bench repo, Windows toasts, link-outs).
 
 Suggested order:
 
-1. `tools/` or `xtask` benchmark-repo generator (100k files, 100k commits, some LFS-like binaries);
-   generate once outside the repo, record the path convention here.
-2. `facet-git`: `status --porcelain=v2 -z --branch` parser (ordinary/renamed/unmerged/untracked/
-   ignored records, branch headers incl. ahead/behind) + golden fixtures + integration tests
-   (renames, unicode, spaces, conflicts, submodule entries, unborn branch).
-3. FS watcher (`notify`) → 150 ms debounce → background status refresh with `.background()`;
-   measure warm refresh on the benchmark repo against the 150 ms budget before building UI on it.
-4. Diff engine: `git diff --no-ext-diff --no-color -z --patch` (index/worktree/HEAD variants) parsed
-   into files → hunks → lines; lazy loading and virtualized rendering for huge diffs; syntect
-   highlighting off the UI thread; word-level intra-line diff.
-5. Staging: file (`add`/`restore --staged`), hunk and line via generated patches fed to
-   `git apply --cached` (and `--reverse`) on stdin; integration tests for each, incl. CRLF files,
-   no-newline-at-EOF, new/deleted files, binary files.
-6. Binary-aware diff view (extension + git's binary detection → metadata card, never text) and
-   image diff (side-by-side / swipe / onion-skin; `image` crate decode off-thread; tga/bmp/webp).
-7. Commit / amend (message editor, hook output surfaced, never `--no-verify`).
-8. Discard with undo: save what is being discarded first (stash-like object / patch in
-   `.git/facet/`), then discard; undo toast restores it. Confirm before destructive actions.
-9. Layout becomes sidebar · file list · diff with remembered splitters; every new control gets an
-   `Action`, a palette entry and a tooltip showing its shortcut.
+1. Job Objects first (G6): spawn network/hook-running git inside a job with `KILL_ON_JOB_CLOSE`;
+   integration test that cancelling kills a child process.
+2. `facet-git`: `log` with an explicit `--format` + `-z` (hash, parents, author, dates, subject),
+   refs from `for-each-ref --format`, streamed in pages; graph lane assignment as a pure, tested
+   function; golden fixtures.
+3. Virtualized graph view; measure 120 fps scrolling over the 100k-commit bench repo (record frame
+   times, not impressions); commit detail reuses the M1 diff pane.
+4. Branches and tags: list, create, rename, delete (confirm + undo via the old SHA), checkout/switch
+   with dirty-tree handling, upstream tracking.
+5. Remotes: list/add/remove; fetch, pull (rebase or ff-only), push (`--force-with-lease` only) with
+   progress; credentials via GCM's own UI plus a `GIT_ASKPASS`/`SSH_ASKPASS` helper (G7); never
+   write global config (G9).
+6. Stash: list, push (incl. partial via pathspec / `--staged`), apply, pop, drop (confirm + undo).
+7. Windows toast notifications for long operations; GitHub/GitLab/Azure DevOps link-outs from the
+   remote URL.
+8. Every new control: `Action` + palette entry + shortcut tooltip; update PLAN.md measurements.

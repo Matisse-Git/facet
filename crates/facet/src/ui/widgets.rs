@@ -116,6 +116,8 @@ pub enum ButtonKind {
     Primary,
     /// Hairline outline: secondary actions.
     Secondary,
+    /// Filled with the danger color: confirms a destructive action.
+    Danger,
 }
 
 /// A text button with an optional leading icon. `tooltip` should include the shortcut.
@@ -126,11 +128,25 @@ pub fn button(
     label: &str,
     tooltip: &str,
 ) -> Response {
+    button_enabled(ui, kind, glyph, label, tooltip, true)
+}
+
+/// [`button`] that can be unavailable: it is dimmed, does not react, and its tooltip should
+/// say what is missing.
+pub fn button_enabled(
+    ui: &mut Ui,
+    kind: ButtonKind,
+    glyph: Option<char>,
+    label: &str,
+    tooltip: &str,
+    enabled: bool,
+) -> Response {
     let palette = Palette::of(ui.ctx());
     let font = theme::body();
     let text_color = match kind {
-        ButtonKind::Primary => palette.on_accent,
-        ButtonKind::Secondary => palette.text,
+        ButtonKind::Primary | ButtonKind::Danger if enabled => palette.on_accent,
+        ButtonKind::Secondary if enabled => palette.text,
+        _ => palette.text_tertiary,
     };
     let galley = ui
         .painter()
@@ -144,18 +160,30 @@ pub fn button(
         galley.size().x + icon_width + space::M * 2.0,
         theme::ROW_HEIGHT,
     );
-    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(size, sense);
 
     let corner = CornerRadius::same(radius::M);
     match kind {
-        ButtonKind::Primary => {
+        ButtonKind::Primary | ButtonKind::Danger if !enabled => {
+            ui.painter().rect_filled(rect, corner, palette.pressed);
+        }
+        ButtonKind::Primary | ButtonKind::Danger => {
             let hover = ui.ctx().animate_bool_with_time_and_easing(
                 response.id.with("hover"),
                 response.hovered(),
                 motion::FAST,
                 motion::ease_out,
             );
-            let base = palette.accent;
+            let base = if kind == ButtonKind::Danger {
+                palette.danger
+            } else {
+                palette.accent
+            };
             let lit = mix(base, Color32::WHITE, 0.12);
             let fill = if response.is_pointer_button_down_on() {
                 mix(base, Color32::BLACK, 0.12)
@@ -193,6 +221,120 @@ pub fn button(
         text_color,
     );
     focus_ring(ui, &response, rect.expand(1.0), radius::M + 1, palette);
+    response.on_hover_text(tooltip)
+}
+
+/// A compact text button at a fixed rectangle (hunk actions, toast actions, segments).
+/// `active` draws it as the chosen option of a group.
+pub fn text_button_at(
+    ui: &Ui,
+    rect: Rect,
+    id: Id,
+    label: &str,
+    tooltip: &str,
+    color: Color32,
+    active: bool,
+) -> Response {
+    let palette = Palette::of(ui.ctx());
+    let response = ui.interact(rect, id, Sense::click());
+    let fill = if active {
+        palette.pressed
+    } else {
+        interaction_fill(ui, &response, palette)
+    };
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(radius::S), fill);
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        theme::small_strong(),
+        color,
+    );
+    focus_ring(ui, &response, rect, radius::S, palette);
+    if tooltip.is_empty() {
+        response
+    } else {
+        response.on_hover_text(tooltip)
+    }
+}
+
+/// Width [`text_button_at`] needs for `label`.
+pub fn text_button_width(ui: &Ui, label: &str) -> f32 {
+    ui.painter()
+        .layout_no_wrap(label.to_owned(), theme::small_strong(), Color32::WHITE)
+        .size()
+        .x
+        + space::S * 2.0
+}
+
+/// A checkbox with a label. Returns the response; `clicked()` means "toggle".
+pub fn checkbox(ui: &mut Ui, checked: bool, label: &str, tooltip: &str, enabled: bool) -> Response {
+    let palette = Palette::of(ui.ctx());
+    let text_color = if enabled {
+        palette.text
+    } else {
+        palette.text_tertiary
+    };
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), theme::body(), text_color);
+    let box_size = 16.0;
+    let size = Vec2::new(
+        box_size + space::S + galley.size().x + space::XS,
+        theme::ROW_HEIGHT,
+    );
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(size, sense);
+    let square = Rect::from_center_size(
+        Pos2::new(rect.left() + box_size / 2.0, rect.center().y),
+        Vec2::splat(box_size),
+    );
+    let corner = CornerRadius::same(radius::S);
+    if checked {
+        ui.painter().rect_filled(
+            square,
+            corner,
+            if enabled {
+                palette.accent
+            } else {
+                palette.text_tertiary
+            },
+        );
+        ui.painter().text(
+            square.center(),
+            Align2::CENTER_CENTER,
+            theme::icon::CHECK,
+            theme::icon_font(11.0),
+            palette.on_accent,
+        );
+    } else {
+        let stroke_color = if response.hovered() {
+            palette.text_secondary
+        } else {
+            palette.text_tertiary
+        };
+        ui.painter().rect(
+            square,
+            corner,
+            interaction_fill(ui, &response, palette),
+            Stroke::new(1.0, stroke_color),
+            StrokeKind::Inside,
+        );
+    }
+    ui.painter().galley(
+        Pos2::new(
+            square.right() + space::S,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        text_color,
+    );
+    focus_ring(ui, &response, rect.expand(1.0), radius::S, palette);
     response.on_hover_text(tooltip)
 }
 
