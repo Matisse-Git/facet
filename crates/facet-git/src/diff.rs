@@ -6,7 +6,7 @@ use crate::parse::{parse_file_diff, FileDiff};
 use crate::{CancellationToken, Git, GitError};
 
 /// Which two versions of a file to compare.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DiffSource {
     /// Index → working tree: what "Changes" shows for a tracked file.
     Unstaged,
@@ -16,6 +16,18 @@ pub enum DiffSource {
     Untracked,
     /// "Ours" (stage 2) → working tree, for a file with merge conflicts.
     Conflict,
+    /// One commit against another (normally its first parent): the history view. `old` is
+    /// `None` for a root commit, which is compared with the empty tree.
+    Commit { old: Option<String>, new: String },
+}
+
+/// The id of the empty tree, in the hash format of `like` (an object id of the repository).
+pub fn empty_tree(like: &str) -> &'static str {
+    if like.len() == 64 {
+        "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321"
+    } else {
+        "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -48,7 +60,7 @@ pub async fn diff_file(
     request: &DiffRequest,
     cancel: Option<&CancellationToken>,
 ) -> Result<FileDiff, GitError> {
-    let mut command = match request.source {
+    let mut command = match &request.source {
         DiffSource::Untracked => git
             .command(["diff", "--no-index"])
             .args(DIFF_ARGS)
@@ -60,6 +72,10 @@ pub async fn diff_file(
             command = match source {
                 DiffSource::Staged => command.args(["--cached", "-M"]),
                 DiffSource::Conflict => command.arg("--ours"),
+                DiffSource::Commit { old, new } => command
+                    .arg("-M")
+                    .arg(old.as_deref().unwrap_or_else(|| empty_tree(new)))
+                    .arg(new),
                 _ => command,
             };
             command = command.arg("--");

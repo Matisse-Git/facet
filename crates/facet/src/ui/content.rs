@@ -1,24 +1,37 @@
-//! The content area. With no repository open it shows the welcome view; with one open it shows
-//! the repository overview (identity + HEAD). Status, diffs and history replace the overview in
-//! later milestones.
+//! The content area: the Settings page while it is open; with no repository open, the welcome
+//! view (open / clone / new, and the recent repositories); a working copy's Changes or History;
+//! and for a bare repository, its overview (identity + HEAD).
 
+use std::path::PathBuf;
 use std::time::SystemTime;
 
-use eframe::egui::{Align, Align2, Id, Layout, Pos2, Rect, RichText, Sense, Ui, UiBuilder, Vec2};
+use eframe::egui::{
+    Align, Align2, CornerRadius, Id, Layout, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, UiBuilder,
+    Vec2,
+};
 use facet_git::{Head, RepoInfo};
 
 use super::widgets::{self, button, skeleton, text_line, ButtonKind};
 use crate::actions::{shortcut, Action};
 use crate::app::{FacetApp, TabState};
+use crate::app_add::AddTab;
 use crate::format::{relative_time, unix_seconds};
-use crate::theme::{self, icon, space, Palette};
+use crate::theme::{self, icon, radius, space, Palette};
 
 const COLUMN_MAX_WIDTH: f32 = 720.0;
 const LABEL_WIDTH: f32 = 128.0;
 const LINE_HEIGHT: f32 = 24.0;
+const WELCOME_WIDTH: f32 = 640.0;
+const TILE_HEIGHT: f32 = 128.0;
+const RECENT_ROW: f32 = 60.0;
+const MAX_RECENT: usize = 6;
 
 impl FacetApp {
     pub(super) fn content(&mut self, ui: &mut Ui, rect: Rect) {
+        if self.settings_view.is_some() {
+            self.settings_page(ui, rect);
+            return;
+        }
         let working_copy = self.active_tab().is_some_and(
             |tab| matches!(&tab.state, TabState::Ready { info, .. } if !info.is_bare()),
         );
@@ -28,7 +41,7 @@ impl FacetApp {
         }
         let mut actions = Vec::new();
         match self.active_tab().map(|tab| &tab.state) {
-            None => welcome(ui, rect, &mut actions),
+            None => welcome(ui, rect, &self.settings.recent_repos, &mut actions),
             Some(TabState::Loading) => overview_skeleton(ui, rect),
             Some(TabState::Ready { info, head }) => overview(ui, rect, info, head, &mut actions),
         }
@@ -36,54 +49,261 @@ impl FacetApp {
     }
 }
 
-fn welcome(ui: &mut Ui, rect: Rect, actions: &mut Vec<Action>) {
+fn welcome(ui: &mut Ui, rect: Rect, recent: &[PathBuf], actions: &mut Vec<Action>) {
     let palette = Palette::of(ui.ctx());
-    let column = Rect::from_center_size(
-        rect.center() - Vec2::new(0.0, space::L),
-        Vec2::new((rect.width() - space::XL * 2.0).clamp(0.0, 440.0), 220.0),
+    let width = (rect.width() - space::XL * 2.0).clamp(0.0, WELCOME_WIDTH);
+    let recent_shown = recent.len().min(MAX_RECENT);
+    let recent_height = if recent_shown == 0 {
+        0.0
+    } else {
+        space::XL + 24.0 + recent_shown as f32 * RECENT_ROW + 8.0
+    };
+    let height = 64.0
+        + space::L
+        + 36.0
+        + space::S
+        + 20.0
+        + space::XL
+        + TILE_HEIGHT
+        + recent_height
+        + space::L
+        + 20.0;
+    let top = (rect.center().y - height / 2.0).max(rect.top() + space::XL);
+    let left = rect.center().x - width / 2.0;
+    let center_x = rect.center().x;
+    let mut y = top;
+
+    // Mark, title, subtitle.
+    widgets::app_mark(
+        ui.painter(),
+        Rect::from_center_size(Pos2::new(center_x, y + 32.0), Vec2::splat(64.0)),
+        palette,
     );
-    ui.scope_builder(
-        UiBuilder::new()
-            .id_salt("welcome")
-            .max_rect(column)
-            .layout(Layout::top_down(Align::Center)),
-        |ui| {
-            ui.spacing_mut().item_spacing.y = 0.0;
-            ui.label(
-                RichText::new("Facet")
-                    .font(theme::title())
-                    .color(palette.text),
-            );
-            ui.add_space(space::S);
-            ui.label(
-                RichText::new("Open a repository to get started.")
-                    .font(theme::body())
-                    .color(palette.text_secondary),
-            );
-            ui.add_space(space::L);
-            let tooltip = widgets::tooltip_with_shortcut(ui, "Open a repository", &shortcut::OPEN);
-            if button(
-                ui,
-                ButtonKind::Primary,
-                Some(icon::FOLDER_OPEN),
-                "Open Repository…",
-                &tooltip,
-            )
+    y += 64.0 + space::L;
+    ui.painter().text(
+        Pos2::new(center_x, y + 18.0),
+        Align2::CENTER_CENTER,
+        "Welcome to Facet",
+        theme::title(),
+        palette.text,
+    );
+    y += 36.0 + space::S;
+    ui.painter().text(
+        Pos2::new(center_x, y + 10.0),
+        Align2::CENTER_CENTER,
+        "A calm, fast Git client. Pick a repository to get started.",
+        theme::body(),
+        palette.text_secondary,
+    );
+    y += 20.0 + space::XL;
+
+    // Open · Clone · New.
+    let gap = space::M;
+    let tile_width = (width - gap * 2.0) / 3.0;
+    let open_tip = widgets::tooltip_with_shortcut(
+        ui,
+        "Open a folder that has a Git repository",
+        &shortcut::OPEN,
+    );
+    for (index, (glyph, title, detail, tooltip, action)) in [
+        (
+            icon::FOLDER_OPEN,
+            "Open folder",
+            "A repository on this PC",
+            open_tip.as_str(),
+            Action::OpenRepository,
+        ),
+        (
+            icon::DOWNLOAD,
+            "Clone",
+            "From GitHub or any URL",
+            "Download a repository from a URL",
+            Action::ShowAddRepository(Some(AddTab::Clone)),
+        ),
+        (
+            icon::NEW_FOLDER,
+            "New repository",
+            "Start from an empty folder",
+            "Create a new, empty repository",
+            Action::ShowAddRepository(Some(AddTab::New)),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let tile = Rect::from_min_size(
+            Pos2::new(left + index as f32 * (tile_width + gap), y),
+            Vec2::new(tile_width, TILE_HEIGHT),
+        );
+        if welcome_tile(ui, tile, glyph, title, detail, palette)
+            .on_hover_text(tooltip)
             .clicked()
-            {
-                actions.push(Action::OpenRepository);
-            }
-            ui.add_space(space::M);
-            ui.label(
-                RichText::new(format!(
-                    "Or drop a folder here.  Press {} for every command.",
-                    widgets::shortcut_text(ui, &shortcut::PALETTE)
-                ))
-                .font(theme::small())
-                .color(palette.text_tertiary),
+        {
+            actions.push(action);
+        }
+    }
+    y += TILE_HEIGHT;
+
+    // Recent repositories.
+    if recent_shown > 0 {
+        y += space::XL;
+        ui.painter().text(
+            Pos2::new(left, y + 12.0),
+            Align2::LEFT_CENTER,
+            "Recent",
+            theme::strong(),
+            palette.text,
+        );
+        y += 24.0 + 8.0;
+        let card = Rect::from_min_size(
+            Pos2::new(left, y),
+            Vec2::new(width, recent_shown as f32 * RECENT_ROW),
+        );
+        ui.painter().rect(
+            card,
+            CornerRadius::same(radius::LAYER),
+            palette.surface_alt,
+            palette.hairline_stroke(),
+            StrokeKind::Inside,
+        );
+        for (index, path) in recent.iter().take(MAX_RECENT).enumerate() {
+            let row = Rect::from_min_size(
+                Pos2::new(card.left(), card.top() + index as f32 * RECENT_ROW),
+                Vec2::new(width, RECENT_ROW),
             );
-        },
+            if index > 0 {
+                widgets::hairline_h(
+                    ui,
+                    row.left() + space::M..=row.right() - space::M,
+                    row.top(),
+                );
+            }
+            let response = widgets::list_row(
+                ui,
+                row.shrink(3.0),
+                Id::unique(("welcome-recent", index)),
+                false,
+            );
+            let name = path.file_name().map_or_else(
+                || path.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            );
+            let tile = Rect::from_min_size(
+                Pos2::new(row.left() + space::M, row.center().y - 18.0),
+                Vec2::splat(36.0),
+            );
+            widgets::monogram(ui.painter(), tile, &name, palette);
+            let text_left = tile.right() + space::M - space::XS;
+            let text_width = row.right() - space::XL - text_left;
+            text_line(
+                ui,
+                Pos2::new(text_left, row.center().y - 9.0),
+                &name,
+                theme::strong(),
+                palette.text,
+                text_width,
+            );
+            text_line(
+                ui,
+                Pos2::new(text_left, row.center().y + 10.0),
+                &path.display().to_string(),
+                theme::small(),
+                palette.text_tertiary,
+                text_width,
+            );
+            if response.hovered() {
+                ui.painter().text(
+                    Pos2::new(row.right() - space::M - 6.0, row.center().y),
+                    Align2::CENTER_CENTER,
+                    icon::CHEVRON_RIGHT,
+                    theme::icon_font(10.0),
+                    palette.text_secondary,
+                );
+            }
+            if response.clicked() {
+                actions.push(Action::OpenPath(path.clone()));
+            }
+            response.context_menu(|ui| {
+                if ui.button("Remove from Recent").clicked() {
+                    actions.push(Action::ForgetRecent(path.clone()));
+                }
+            });
+        }
+        y = card.bottom();
+    }
+
+    // Hint.
+    y += space::L;
+    ui.painter().text(
+        Pos2::new(center_x, y + 10.0),
+        Align2::CENTER_CENTER,
+        format!(
+            "Drop a folder anywhere, or press {} for every command.",
+            widgets::shortcut_text(ui, &shortcut::PALETTE)
+        ),
+        theme::small(),
+        palette.text_tertiary,
     );
+}
+
+/// One of the welcome view's three big choices.
+fn welcome_tile(
+    ui: &Ui,
+    rect: Rect,
+    glyph: char,
+    title: &str,
+    detail: &str,
+    palette: &Palette,
+) -> eframe::egui::Response {
+    let response = ui.interact(rect, Id::unique(("welcome-tile", title)), Sense::click());
+    let hover = ui.ctx().animate_bool_with_time_and_easing(
+        response.id.with("hover"),
+        response.hovered(),
+        theme::motion::FAST,
+        theme::motion::ease_out,
+    );
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(radius::LAYER),
+        widgets::mix(palette.surface_alt, palette.raised, hover),
+        Stroke::new(
+            1.0,
+            widgets::mix(palette.hairline, palette.text_tertiary, hover * 0.6),
+        ),
+        StrokeKind::Inside,
+    );
+    widgets::focus_ring(ui, &response, rect, radius::LAYER, palette);
+    let badge = Rect::from_min_size(rect.min + Vec2::splat(space::M), Vec2::splat(36.0));
+    ui.painter().rect_filled(
+        badge,
+        CornerRadius::same(radius::LAYER),
+        palette.accent_soft,
+    );
+    ui.painter().text(
+        badge.center(),
+        Align2::CENTER_CENTER,
+        glyph,
+        theme::icon_font(18.0),
+        palette.accent,
+    );
+    let text_width = rect.width() - space::M * 2.0;
+    text_line(
+        ui,
+        Pos2::new(rect.left() + space::M, badge.bottom() + space::M + 2.0),
+        title,
+        theme::strong(),
+        palette.text,
+        text_width,
+    );
+    text_line(
+        ui,
+        Pos2::new(rect.left() + space::M, badge.bottom() + space::M + 22.0),
+        detail,
+        theme::small(),
+        palette.text_secondary,
+        text_width,
+    );
+    response
 }
 
 /// The padded column both the overview and its skeleton are laid out in.

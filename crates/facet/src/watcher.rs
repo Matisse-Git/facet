@@ -97,7 +97,8 @@ fn classify(workdir: &Path, git_dir: &Path, path: &Path) -> Option<Kind> {
             other
                 if other.starts_with("refs/")
                     || other.starts_with("rebase-merge")
-                    || other.starts_with("rebase-apply") =>
+                    || other.starts_with("rebase-apply")
+                    || other.starts_with("sequencer") =>
             {
                 Some(Kind::Refs)
             }
@@ -216,6 +217,8 @@ mod tests {
         assert_eq!(kind(r"D:\repo\.git\refs\heads\main"), Some(Kind::Refs));
         assert_eq!(kind(r"D:\repo\.git\packed-refs"), Some(Kind::Refs));
         assert_eq!(kind(r"D:\repo\.git\MERGE_HEAD"), Some(Kind::Refs));
+        assert_eq!(kind(r"D:\repo\.git\sequencer\todo"), Some(Kind::Refs));
+        assert_eq!(kind(r"D:\repo\.git\facet-rebase\todo"), None);
         for noise in [
             r"D:\repo\.git\index.lock",
             r"D:\repo\.git\HEAD.lock",

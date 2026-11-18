@@ -141,6 +141,85 @@ async fn cancellation_kills_a_running_command() {
     assert_eq!(last.outcome, CommandOutcome::Cancelled);
 }
 
+/// G6: killing `git.exe` alone leaves its children (hooks, `sh`, ssh, credential helpers)
+/// running. Commands run in a Job Object, so cancelling ends the whole process tree.
+#[tokio::test]
+async fn cancellation_kills_the_whole_process_tree() {
+    let repo = TestRepo::init().await;
+    let token = CancellationToken::new();
+    let canceller = token.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        canceller.cancel();
+    });
+
+    // git → sh → sleep; the shell writes the marker only if it outlives the cancel.
+    let result = repo
+        .git
+        .command([
+            "-c",
+            "alias.slow=!sleep 2 && echo survived > marker.txt",
+            "slow",
+        ])
+        .current_dir(&repo.path)
+        .cancel_with(&token)
+        .output()
+        .await;
+    assert!(matches!(result, Err(GitError::Cancelled)), "{result:?}");
+
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    assert!(
+        !repo.exists("marker.txt"),
+        "a child of git kept running after the command was cancelled"
+    );
+}
+
+/// Dropping a command's future (a closed tab, an exiting app) ends its process tree too.
+#[tokio::test]
+async fn dropping_a_running_command_kills_its_process_tree() {
+    let repo = TestRepo::init().await;
+    let command = repo
+        .git
+        .command([
+            "-c",
+            "alias.slow=!sleep 2 && echo survived > marker.txt",
+            "slow",
+        ])
+        .current_dir(&repo.path)
+        .output();
+    let timed_out = tokio::time::timeout(Duration::from_millis(400), command).await;
+    assert!(timed_out.is_err(), "the command should still be running");
+
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    assert!(!repo.exists("marker.txt"));
+}
+
+/// A command that finishes normally does not take down what it deliberately left running
+/// in the background (`git gc --auto` detaches this way after a fetch).
+#[tokio::test]
+async fn a_finished_command_leaves_detached_children_alone() {
+    let repo = TestRepo::init().await;
+    repo.git
+        .command([
+            "-c",
+            "alias.detach=!(sleep 1 && echo done > marker.txt) </dev/null >/dev/null 2>&1 &",
+            "detach",
+        ])
+        .current_dir(&repo.path)
+        .run()
+        .await
+        .unwrap();
+    let mut found = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if repo.exists("marker.txt") {
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "the detached child was killed when git exited");
+}
+
 #[tokio::test]
 async fn an_already_cancelled_token_stops_immediately() {
     let repo = TestRepo::init().await;
@@ -213,4 +292,38 @@ async fn background_commands_do_not_take_optional_locks() {
         .unwrap();
     let after = std::fs::metadata(&index).unwrap().modified().unwrap();
     assert_eq!(before, after, "background status must not write the index");
+}
+
+#[tokio::test]
+async fn another_executable_keeps_the_log_and_environment() {
+    let repo = TestRepo::init().await;
+    let marked = repo.git.with_env("FACET_TEST_MARK", "kept");
+
+    // A path that does not exist: `git version` fails instead of running some other git.
+    let missing = marked.with_exe(repo.path.join("no-such-git.exe"));
+    assert!(facet_git::version(&missing).await.is_err());
+
+    // The real one again (as a full path, the way settings store it): the environment set
+    // before the switch still reaches git.
+    let found = String::from_utf8(
+        std::process::Command::new("where")
+            .arg("git")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let exe = found.lines().next().unwrap().trim().to_owned();
+    let real = missing.with_exe(&exe);
+    assert_eq!(real.exe(), std::path::Path::new(&exe));
+    assert!(facet_git::version(&real).await.is_ok());
+    let env = real
+        .command(["-c", "alias.mark=!echo $FACET_TEST_MARK", "mark"])
+        .current_dir(&repo.path)
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&env.stdout).trim(), "kept");
+    // Every handle writes to the same command log.
+    assert!(Arc::ptr_eq(real.log(), repo.git.log()));
 }

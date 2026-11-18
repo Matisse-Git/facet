@@ -7,14 +7,26 @@
 
 mod actions;
 mod app;
+mod app_add;
+mod app_power;
+mod app_repo;
+mod app_settings;
+mod app_trees;
 mod app_work;
+mod bench;
 mod filekind;
 mod format;
 mod fuzzy;
+mod gitignore;
 mod highlight;
+mod history;
 mod icon;
+mod icon_art;
+mod instance;
+mod integrations;
 mod loader;
 mod platform;
+mod power;
 mod settings;
 mod textdiff;
 mod theme;
@@ -33,6 +45,18 @@ use eframe::wgpu;
 use crate::settings::Settings;
 
 fn main() -> eframe::Result {
+    // Started by git as GIT_ASKPASS / SSH_ASKPASS: relay the prompt to the running app and
+    // exit, before any window or runtime exists (PLAN.md, G7).
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    // Started by git as the rebase sequence / message editor (M3). Checked before askpass:
+    // the editor inherits the app's askpass environment, which would otherwise claim it.
+    if let Some(code) = facet_git::rebase::editor_main(&args) {
+        std::process::exit(code);
+    }
+    if let Some(code) = facet_git::askpass::helper_main(&args) {
+        std::process::exit(code);
+    }
+
     let startup = Instant::now();
     let settings = Settings::load();
 
@@ -44,11 +68,24 @@ fn main() -> eframe::Result {
         .build()
         .expect("failed to start the background runtime");
 
-    // `facet <path>` opens that repository. Anything that looks like a flag is ignored.
+    // `facet <path>` opens that repository. Anything that looks like a flag is ignored. The
+    // path is made absolute here: it may be handed to an instance with another directory.
     let open_on_launch = std::env::args_os()
         .skip(1)
         .find(|arg| !arg.to_string_lossy().starts_with('-'))
-        .map(PathBuf::from);
+        .map(PathBuf::from)
+        .map(|path| std::path::absolute(&path).unwrap_or(path));
+
+    // One Facet per settings folder: a second launch hands its path to the first and exits.
+    let instance = {
+        let _entered = runtime.enter();
+        let name = instance::pipe_name(Settings::config_dir().as_deref());
+        match instance::claim(&name, open_on_launch.as_deref()) {
+            instance::Claim::Primary(server) => Some(server),
+            instance::Claim::Forwarded => return Ok(()),
+            instance::Claim::Alone => None,
+        }
+    };
 
     // A transparent swapchain is what lets the Mica backdrop show through: on DX12 that needs
     // a DirectComposition-backed swapchain rather than the default HWND one.
@@ -105,6 +142,7 @@ fn main() -> eframe::Result {
                 runtime,
                 startup,
                 open_on_launch,
+                instance,
             )))
         }),
     )

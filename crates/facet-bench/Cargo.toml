@@ -1,6 +1,6 @@
 [package]
 name = "facet-bench"
-description = "Benchmark repository generator and performance measurements for Facet."
+description = "Developer tooling for Facet: benchmark repositories, measurements and the MSIX package."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 facet-git = { path = "../facet-git" }
 tokio = { workspace = true }
+png = "0.18"
 
 [lints]
 workspace = true

@@ -2,13 +2,20 @@
 //!
 //! ```text
 //! cargo run --release -p facet-bench -- generate [--files N] [--commits N] [--force] [DIR]
+//! cargo run --release -p facet-bench -- graph [--commits N] [--branches N] [--force] [DIR]
 //! cargo run --release -p facet-bench -- measure [--runs N] [--perf on|off] [DIR]
+//! cargo run --release -p facet-bench -- history [--runs N] [DIR]
+//! cargo run --release -p facet-bench -- package [--exe PATH] [--publisher "CN=..."] [DIR]
 //! ```
+//!
+//! `graph` builds a lane-heavy history (topic branches, forks, merges) in `target/bench-graph`
+//! for the commit graph; the main benchmark repository's history is linear.
 //!
 //! `generate` streams a synthetic history into `git fast-import` (100k files and 100k commits
 //! by default: C++-like sources in a deep tree, Unreal-style binary assets, one 10 MB text
 //! file), checks it out, and leaves the working tree dirty the way a working day does.
-//! `measure` times what Facet runs, through the same `facet-git` functions the app calls.
+//! `measure` times what Facet runs, through the same `facet-git` functions the app calls;
+//! `history` does the same for search, file history, the reflog and blame (M3).
 //! `DIR` defaults to `target/bench-repo`. Nothing here touches any other repository or any
 //! global git configuration.
 
@@ -20,6 +27,8 @@ use std::time::{Duration, Instant};
 
 use facet_git::parse::{parse_file_diff, parse_status};
 use facet_git::{CommandLog, DiffRequest, DiffSource, Git};
+
+mod package;
 
 const DEFAULT_DIR: &str = "target/bench-repo";
 const BIG_FILE: &str = "Docs/Generated/Big.txt";
@@ -35,9 +44,15 @@ fn main() {
     let result = match args.first().map(String::as_str) {
         Some("generate") => generate(&args[1..]),
         Some("measure") => measure(&args[1..]),
+        Some("graph") => generate_graph(&args[1..]),
+        Some("history") => measure_history(&args[1..]),
+        Some("package") => package::run(&args[1..]),
         _ => Err(
             "usage: facet-bench generate [--files N] [--commits N] [--force] [DIR]\n       \
-             facet-bench measure [--runs N] [--perf on|off] [DIR]"
+             facet-bench graph [--commits N] [--branches N] [--force] [DIR]\n       \
+             facet-bench measure [--runs N] [--perf on|off] [DIR]
+                    facet-bench history [--runs N] [DIR]
+                    facet-bench package [--exe PATH] [--publisher \"CN=...\"] [DIR]"
                 .to_owned(),
         ),
     };
@@ -340,6 +355,155 @@ fn generate(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+// ----- graph ---------------------------------------------------------------------------------
+
+const GRAPH_DIR: &str = "target/bench-graph";
+
+/// One commit of the lane-heavy history: on `branch`, after `from`, optionally merging `merge`.
+fn graph_commit(
+    out: &mut impl Write,
+    number: usize,
+    branch: &str,
+    from: Option<usize>,
+    merge: Option<usize>,
+    message: &str,
+) -> std::io::Result<()> {
+    let time = 1_600_000_000 + number as u64 * 600;
+    writeln!(
+        out,
+        "commit refs/heads/{branch}\nmark :{number}\n\
+         author Facet Bench <bench@example.invalid> {time} +0000\n\
+         committer Facet Bench <bench@example.invalid> {time} +0000\ndata {}\n{message}",
+        message.len()
+    )?;
+    if let Some(from) = from {
+        writeln!(out, "from :{from}")?;
+    }
+    if let Some(merge) = merge {
+        writeln!(out, "merge :{merge}")?;
+    }
+    Ok(())
+}
+
+/// A history for the commit graph rather than for status: `--branches` topic branches
+/// committed to in interleaved order, regularly merged into `main` and restarted from it, so
+/// the graph has many concurrent lanes, forks and merges. Every commit touches one tiny file.
+fn generate_graph(args: &[String]) -> Result<()> {
+    let mut options = parse_options(
+        args,
+        &[("--commits", 100_000), ("--branches", 24)],
+        &["--force"],
+        &[],
+    )?;
+    if options.dir == Path::new(DEFAULT_DIR) {
+        options.dir = PathBuf::from(GRAPH_DIR);
+    }
+    let (commits, branches, dir) = (
+        options.number("--commits").max(2),
+        options.number("--branches").max(1),
+        options.dir.clone(),
+    );
+    if dir.exists() {
+        if !options.flag("--force") {
+            return Err(format!(
+                "{} already exists; pass --force to replace it",
+                dir.display()
+            ));
+        }
+        std::fs::remove_dir_all(&dir)
+            .map_err(|error| format!("removing {}: {error}", dir.display()))?;
+    }
+    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let started = Instant::now();
+    git(&dir, &["init", "-q", "-b", "main"])?;
+    for (key, value) in [("core.autocrlf", "false"), ("gc.auto", "0")] {
+        git(&dir, &["config", "--local", key, value])?;
+    }
+
+    let mut import = Command::new("git")
+        .args(["fast-import", "--quiet", "--done"])
+        .current_dir(&dir)
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("git fast-import: {error}"))?;
+    let mut merges = 0;
+    {
+        let stdin = import.stdin.take().ok_or("no stdin for fast-import")?;
+        let mut out = BufWriter::with_capacity(1 << 20, stdin);
+        let io = |error: std::io::Error| format!("writing to fast-import: {error}");
+        graph_commit(&mut out, 1, "main", None, None, "Start").map_err(io)?;
+        blob(&mut out, "README.md", b"graph benchmark\n").map_err(io)?;
+
+        let mut rng = Rng(0x0BAD_C0FF_EE15_600D);
+        let mut main = 1;
+        let mut tips: Vec<Option<usize>> = vec![None; branches];
+        for number in 2..=commits {
+            let roll = rng.below(100);
+            let open: Vec<usize> = (0..branches).filter(|b| tips[*b].is_some()).collect();
+            if roll < 6 && !open.is_empty() {
+                // Merge a topic into main; it starts over from main later.
+                let topic = open[rng.below(open.len())];
+                let tip = tips[topic].take();
+                graph_commit(
+                    &mut out,
+                    number,
+                    "main",
+                    Some(main),
+                    tip,
+                    &format!("Merge topic-{topic:02}"),
+                )
+                .map_err(io)?;
+                main = number;
+                merges += 1;
+            } else if roll < 14 {
+                graph_commit(
+                    &mut out,
+                    number,
+                    "main",
+                    Some(main),
+                    None,
+                    &format!("Fix {number}"),
+                )
+                .map_err(io)?;
+                blob(&mut out, "main.txt", format!("{number}\n").as_bytes()).map_err(io)?;
+                main = number;
+            } else {
+                let topic = rng.below(branches);
+                let from = tips[topic].unwrap_or(main);
+                graph_commit(
+                    &mut out,
+                    number,
+                    &format!("topic-{topic:02}"),
+                    Some(from),
+                    None,
+                    &format!("Work {number} on topic {topic}"),
+                )
+                .map_err(io)?;
+                blob(
+                    &mut out,
+                    &format!("topics/{topic:02}.txt"),
+                    format!("{number}\n").as_bytes(),
+                )
+                .map_err(io)?;
+                tips[topic] = Some(number);
+            }
+        }
+        out.write_all(b"done\n").map_err(io)?;
+        out.flush().map_err(io)?;
+    }
+    let status = import.wait().map_err(|error| error.to_string())?;
+    if !status.success() {
+        return Err(format!("git fast-import failed: {status}"));
+    }
+    git(&dir, &["reset", "-q", "--hard", "main"])?;
+    println!(
+        "generated {} in {:.1?}: {commits} commits, {branches} topic branches, {merges} merges",
+        dir.display(),
+        started.elapsed()
+    );
+    Ok(())
+}
+
 // ----- measure -------------------------------------------------------------------------------
 
 struct Timings(Vec<Duration>);
@@ -495,6 +659,126 @@ async fn measure_async(dir: &Path, runs: usize, perf: Option<&str>) -> Result<()
         timings.0.push(started.elapsed());
     }
     println!("10 MB diff parse only:  {}", timings.summary());
+    Ok(())
+}
+
+/// A file the benchmark history changes now and then, and the latest commit's file.
+const HISTORY_FILE: &str = "Source/Module05/Private/Group05/File005567.cpp";
+
+fn measure_history(args: &[String]) -> Result<()> {
+    let options = parse_options(args, &[("--runs", 3)], &[], &[])?;
+    let runs = options.number("--runs").max(1);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    runtime.block_on(measure_history_async(&options.dir, runs))
+}
+
+async fn measure_history_async(dir: &Path, runs: usize) -> Result<()> {
+    use facet_git::{CancellationToken, SearchKind};
+
+    let git = Git::new("git", Arc::new(CommandLog::new(64)));
+    let text = |error: facet_git::GitError| error.to_string();
+    let info = facet_git::discover(&git, dir).await.map_err(text)?;
+    let root = info.root().to_owned();
+    let cancel = CancellationToken::new();
+    println!("repository {}", root.display());
+
+    let mut timings = Timings(Vec::new());
+    let mut count = 0;
+    for _ in 0..runs {
+        let started = Instant::now();
+        count = facet_git::reflog(&git, &root, "HEAD", 5000)
+            .await
+            .map_err(text)?
+            .len();
+        timings.0.push(started.elapsed());
+    }
+    println!(
+        "reflog (HEAD, 5000):     {} -> {count} entries",
+        timings.summary()
+    );
+
+    // The pages the app's search streams: 200 first, then 5000 at a time.
+    for (kind, query) in [
+        (SearchKind::Message, "Change 9999"),
+        (SearchKind::Author, "bench"),
+        (SearchKind::Path, "File005567"),
+        (SearchKind::Pickaxe, "CHANGED"),
+    ] {
+        let mut first = Timings(Vec::new());
+        let mut all = Timings(Vec::new());
+        let mut count = 0;
+        for _ in 0..runs {
+            let started = Instant::now();
+            let mut first_page = None;
+            count = facet_git::stream_search(&git, &root, kind, query, &cancel, 200, 5000, |_| {
+                first_page.get_or_insert_with(|| started.elapsed());
+            })
+            .await
+            .map_err(text)?;
+            all.0.push(started.elapsed());
+            first
+                .0
+                .push(first_page.unwrap_or_else(|| started.elapsed()));
+        }
+        println!(
+            "search {:<8} {:<12} first page {}
+                          all {} -> {count} commits",
+            kind.label(),
+            format!("\"{query}\""),
+            first.summary(),
+            all.summary()
+        );
+    }
+
+    let mut timings = Timings(Vec::new());
+    let mut count = 0;
+    for _ in 0..runs {
+        let started = Instant::now();
+        count = facet_git::file_history(&git, &root, HISTORY_FILE, &cancel)
+            .await
+            .map_err(text)?
+            .len();
+        timings.0.push(started.elapsed());
+    }
+    println!(
+        "file history (--follow): {} -> {count} commits",
+        timings.summary()
+    );
+
+    for path in [HISTORY_FILE, BIG_FILE] {
+        let mut first = Timings(Vec::new());
+        let mut all = Timings(Vec::new());
+        let mut lines = 0;
+        for _ in 0..runs {
+            let started = Instant::now();
+            let mut first_range = None;
+            let mut covered = 0u64;
+            facet_git::blame(&git, &root, path, None, &cancel, |_, ranges| {
+                first_range.get_or_insert_with(|| started.elapsed());
+                covered += ranges
+                    .iter()
+                    .map(|range| u64::from(range.count))
+                    .sum::<u64>();
+            })
+            .await
+            .map_err(text)?;
+            all.0.push(started.elapsed());
+            first
+                .0
+                .push(first_range.unwrap_or_else(|| started.elapsed()));
+            lines = covered;
+        }
+        println!(
+            "blame {path}:
+                          first lines {}
+                          all {} -> {lines} lines",
+            first.summary(),
+            all.summary()
+        );
+    }
     Ok(())
 }
 

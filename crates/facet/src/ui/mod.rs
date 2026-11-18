@@ -4,13 +4,20 @@
 //! Layout is computed by hand from rectangles rather than egui panels so that every edge sits
 //! exactly on the design grid and the chrome regions can stay transparent over Mica.
 
+mod add_repo;
 mod changes;
 mod command_log;
 pub mod confirm;
 mod content;
 mod diff;
+mod history;
+pub use diff::LINE_HEIGHT as DIFF_LINE;
+pub use history::COMMIT_ROW;
 mod image_diff;
 pub mod palette;
+mod power;
+pub mod prompt;
+mod settings;
 mod sidebar;
 mod titlebar;
 pub mod toast;
@@ -65,7 +72,8 @@ impl FacetApp {
         // Animated open/closed fractions for the two collapsible regions.
         let sidebar_open = ctx.animate_bool_with_time_and_easing(
             Id::unique("sidebar-open"),
-            self.settings.sidebar_visible,
+            // No repository open: the welcome view has the whole window.
+            self.settings.sidebar_visible && !self.tabs.is_empty(),
             motion::NORMAL,
             motion::ease_out,
         );
@@ -99,7 +107,7 @@ impl FacetApp {
         // Extending it one point past the right/bottom window edges hides those two strokes.
         let corner = if sidebar_width > 0.5 {
             CornerRadius {
-                nw: radius::L,
+                nw: radius::LAYER,
                 ..CornerRadius::ZERO
             }
         } else {
@@ -140,11 +148,11 @@ impl FacetApp {
         }
 
         // Splitters go last so they sit above the views they resize.
-        if self.settings.sidebar_visible && sidebar_open >= 1.0 {
+        if self.settings.sidebar_visible && !self.tabs.is_empty() && sidebar_open >= 1.0 {
             let grab = Rect::from_min_max(
                 Pos2::new(
                     sidebar.right() - SPLITTER_GRAB / 2.0,
-                    body.top() + f32::from(radius::L),
+                    body.top() + f32::from(radius::LAYER),
                 ),
                 Pos2::new(sidebar.right() + SPLITTER_GRAB / 2.0, body.bottom()),
             );
@@ -197,7 +205,11 @@ impl FacetApp {
         self.drop_overlay(ui, content);
         self.toast_layer(ui, content);
         self.palette_layer(ui, window);
+        self.rebase_layer(ui, window);
+        self.conflict_layer(ui, window);
+        self.add_repo_layer(ui, window);
         self.confirm_layer(ui, window);
+        self.prompt_layer(ui, window);
     }
 
     /// Highlight the content area while files are dragged over the window.

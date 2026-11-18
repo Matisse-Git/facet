@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cmdlog::{CommandLog, CommandOutcome};
 use crate::error::GitError;
+use crate::job::Job;
 
 /// Arguments placed before the subcommand on every invocation.
 ///
@@ -59,6 +60,29 @@ impl Git {
         }
     }
 
+    /// Returns a handle that runs a different git executable with the same log and
+    /// environment (the git path chosen in settings).
+    #[must_use]
+    pub fn with_exe(&self, exe: impl Into<PathBuf>) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                exe: exe.into(),
+                log: self.inner.log.clone(),
+                env: self.inner.env.clone(),
+            }),
+        }
+    }
+
+    /// [`Git::with_env`] for several variables at once (the askpass environment).
+    #[must_use]
+    pub fn with_envs(&self, vars: &[(OsString, OsString)]) -> Self {
+        let mut git = self.clone();
+        for (key, value) in vars {
+            git = git.with_env(key.clone(), value.clone());
+        }
+        git
+    }
+
     pub fn log(&self) -> &Arc<CommandLog> {
         &self.inner.log
     }
@@ -81,9 +105,13 @@ impl Git {
             stdin: None,
             optional_locks: true,
             log_stdout: false,
+            progress: None,
         }
     }
 }
+
+/// Receives git's progress lines (`--progress` output on stderr) as they are printed.
+pub type ProgressFn = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// A finished git process.
 #[derive(Debug, Clone)]
@@ -114,6 +142,7 @@ pub struct GitCommand {
     stdin: Option<Vec<u8>>,
     optional_locks: bool,
     log_stdout: bool,
+    progress: Option<ProgressFn>,
 }
 
 impl GitCommand {
@@ -161,6 +190,14 @@ impl GitCommand {
     /// for people (hook output during `commit`), never for commands whose stdout is data.
     pub fn log_stdout(mut self) -> Self {
         self.log_stdout = true;
+        self
+    }
+
+    /// Hand each progress line git prints on stderr to `on_line` as it appears (git redraws
+    /// a line with `\r`; every redraw is delivered). The text is shown to people as is,
+    /// never parsed. The collected stderr keeps only the final state of each line.
+    pub fn progress(mut self, on_line: ProgressFn) -> Self {
+        self.progress = Some(on_line);
         self
     }
 
@@ -257,10 +294,33 @@ impl GitCommand {
             }
         };
 
+        // G6: the job takes git's children with it on cancel; see `job.rs`. If the job can't
+        // be set up (Facet itself runs in a job that forbids nesting), cancelling still
+        // kills git.exe as before.
+        let job = Job::new().ok().filter(|job| {
+            #[cfg(windows)]
+            {
+                child
+                    .raw_handle()
+                    .is_some_and(|handle| job.assign(handle).is_ok())
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = job;
+                false
+            }
+        });
+        let kill = |job: &Option<Job>| {
+            if let Some(job) = job {
+                job.terminate();
+            }
+        };
+
         let stdin_pipe = child.stdin.take();
         let stdout_pipe = child.stdout.take();
         let stderr_pipe = child.stderr.take();
         let stdin_data = self.stdin;
+        let progress = self.progress;
 
         let io = async {
             let feed = async {
@@ -273,7 +333,7 @@ impl GitCommand {
             let ((), stdout, stderr) = tokio::join!(
                 feed,
                 read_stdout(stdout_pipe, on_chunk),
-                read_all(stderr_pipe)
+                read_stderr(stderr_pipe, progress)
             );
             Ok::<_, std::io::Error>((stdout?, stderr?))
         };
@@ -290,11 +350,13 @@ impl GitCommand {
         let (stdout, stderr) = match io_result {
             Some(Ok(streams)) => streams,
             Some(Err(err)) => {
+                kill(&job);
                 let _ = child.kill().await;
                 log.finish(id, CommandOutcome::Exited(-1), started.elapsed(), b"");
                 return Err(GitError::Io(err));
             }
             None => {
+                kill(&job);
                 let _ = child.kill().await;
                 log.finish(id, CommandOutcome::Cancelled, started.elapsed(), b"");
                 return Err(GitError::Cancelled);
@@ -313,11 +375,15 @@ impl GitCommand {
                 return Err(GitError::Io(err));
             }
             None => {
+                kill(&job);
                 let _ = child.kill().await;
                 log.finish(id, CommandOutcome::Cancelled, started.elapsed(), &stderr);
                 return Err(GitError::Cancelled);
             }
         };
+        if let Some(job) = job {
+            job.release();
+        }
 
         if self.log_stdout && !stdout.is_empty() {
             let mut combined = stdout.clone();
@@ -365,6 +431,76 @@ async fn read_all(pipe: Option<impl AsyncRead + Unpin>) -> std::io::Result<Vec<u
         pipe.read_to_end(&mut buf).await?;
     }
     Ok(buf)
+}
+
+/// Collect stderr; with a progress callback, also deliver each line (and each `\r` redraw
+/// of it) as it arrives. The collected text keeps only the final state of each line.
+async fn read_stderr(
+    pipe: Option<impl AsyncRead + Unpin>,
+    progress: Option<ProgressFn>,
+) -> std::io::Result<Vec<u8>> {
+    let Some(progress) = progress else {
+        return read_all(pipe).await;
+    };
+    let Some(mut pipe) = pipe else {
+        return Ok(Vec::new());
+    };
+    let mut lines = ProgressLines::default();
+    let mut chunk = vec![0u8; 4096];
+    loop {
+        let n = pipe.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        lines.feed(&chunk[..n], &*progress);
+    }
+    Ok(lines.finish(&*progress))
+}
+
+/// Splits stderr into lines and `\r` redraws (see [`read_stderr`]).
+#[derive(Default)]
+struct ProgressLines {
+    collected: Vec<u8>,
+    line: Vec<u8>,
+    /// The last `\r`-terminated redraw of the current line.
+    redraw: Vec<u8>,
+}
+
+impl ProgressLines {
+    fn feed(&mut self, bytes: &[u8], progress: &(dyn Fn(&str) + Send + Sync)) {
+        for &byte in bytes {
+            match byte {
+                b'\r' => {
+                    if !self.line.is_empty() {
+                        progress(String::from_utf8_lossy(&self.line).trim_end());
+                        self.redraw = std::mem::take(&mut self.line);
+                    }
+                }
+                b'\n' => {
+                    if !self.line.is_empty() {
+                        progress(String::from_utf8_lossy(&self.line).trim_end());
+                        self.collected.extend_from_slice(&self.line);
+                    } else {
+                        self.collected.extend_from_slice(&self.redraw);
+                    }
+                    self.collected.push(b'\n');
+                    self.line.clear();
+                    self.redraw.clear();
+                }
+                other => self.line.push(other),
+            }
+        }
+    }
+
+    fn finish(mut self, progress: &(dyn Fn(&str) + Send + Sync)) -> Vec<u8> {
+        if !self.line.is_empty() {
+            progress(String::from_utf8_lossy(&self.line).trim_end());
+            self.collected.extend_from_slice(&self.line);
+        } else {
+            self.collected.extend_from_slice(&self.redraw);
+        }
+        self.collected
+    }
 }
 
 async fn read_stdout<F>(
@@ -416,6 +552,32 @@ mod tests {
         assert_eq!(quote(""), "\"\"");
         assert_eq!(quote("my file.txt"), "\"my file.txt\"");
         assert_eq!(quote("say \"hi\""), "\"say \\\"hi\\\"\"");
+    }
+
+    #[test]
+    fn progress_redraws_are_delivered_and_collapsed() {
+        let seen = std::sync::Mutex::new(Vec::<String>::new());
+        let record = |line: &str| seen.lock().unwrap().push(line.to_owned());
+        let mut lines = ProgressLines::default();
+        lines.feed(b"remote: Counting objects: 1\r", &record);
+        lines.feed(b"remote: Counting objects: 2\rremote: Counting", &record);
+        lines.feed(b" objects: 3, done.\nFrom x\n", &record);
+        lines.feed(b"Receiving: 50%\r", &record);
+        let collected = lines.finish(&record);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "remote: Counting objects: 1",
+                "remote: Counting objects: 2",
+                "remote: Counting objects: 3, done.",
+                "From x",
+                "Receiving: 50%",
+            ]
+        );
+        assert_eq!(
+            String::from_utf8(collected).unwrap(),
+            "remote: Counting objects: 3, done.\nFrom x\nReceiving: 50%"
+        );
     }
 
     #[test]

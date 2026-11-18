@@ -1,0 +1,41 @@
+431abd0893e305f53638a04cc110afd6ac7479d8 1 1 1
+author Ann Author
+author-mail <ann@facet.invalid>
+author-time 1700000800
+author-tz +0000
+committer Ann Author
+committer-mail <ann@facet.invalid>
+committer-time 1700000900
+committer-tz +0000
+summary Prepend zero, amended
+previous f698faec8ff80f69191c28bb67ce71185b5b6242 docs/notes.txt
+filename docs/notes.txt
+4c786b6765fff3de1bcd5fcd4b7e9c4d384c215b 2 3 1
+author Ann Author
+author-mail <ann@facet.invalid>
+author-time 1700000200
+author-tz +0000
+committer Ann Author
+committer-mail <ann@facet.invalid>
+committer-time 1700000200
+committer-tz +0000
+summary Edit: uppercase two
+previous f7d00a3fbd1c610c2fadeaacf9b4aceba67d665b "notes \303\251t\303\251.txt"
+filename "notes \303\251t\303\251.txt"
+4c786b6765fff3de1bcd5fcd4b7e9c4d384c215b 4 5 1
+previous f7d00a3fbd1c610c2fadeaacf9b4aceba67d665b "notes \303\251t\303\251.txt"
+filename "notes \303\251t\303\251.txt"
+f7d00a3fbd1c610c2fadeaacf9b4aceba67d665b 1 2 1
+author Ann Author
+author-mail <ann@facet.invalid>
+author-time 1700000100
+author-tz +0000
+committer Ann Author
+committer-mail <ann@facet.invalid>
+committer-time 1700000100
+committer-tz +0000
+summary Add notes
+boundary
+filename "notes \303\251t\303\251.txt"
+f7d00a3fbd1c610c2fadeaacf9b4aceba67d665b 3 4 1
+filename "notes \303\251t\303\251.txt"

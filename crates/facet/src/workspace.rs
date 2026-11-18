@@ -6,7 +6,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use eframe::egui::TextureHandle;
-use facet_git::parse::{BranchInfo, EntryKind, FileDiff, LineKind, Status, StatusEntry};
+use facet_git::parse::{BranchInfo, EntryKind, FileDiff, LineKind, LogCommit, Status, StatusEntry};
 use facet_git::{CancellationToken, DiffRequest, DiffSource, PerfConfig, UndoEntry};
 
 use crate::highlight::Decorations;
@@ -61,6 +61,18 @@ pub struct BinaryInfo {
     pub new_size: Option<u64>,
     /// The content is stored with Git LFS (the repository holds a pointer).
     pub lfs: bool,
+}
+
+/// A submodule pointer change, shown as the commits between the two recorded commits.
+pub struct SubmoduleDiff {
+    /// The commit recorded before and after (`None`: the submodule was added / removed).
+    pub old: Option<String>,
+    pub new: Option<String>,
+    /// Commits the change brings in and drops, newest first.
+    pub added: Vec<LogCommit>,
+    pub removed: Vec<LogCommit>,
+    /// Why the commits can't be listed (not checked out, commits not fetched).
+    pub unavailable: Option<String>,
 }
 
 #[derive(Clone)]
@@ -184,6 +196,8 @@ pub enum DiffBody {
     Image(ImageDiff),
     /// The two versions are identical (or differ only in file mode).
     Unchanged(Arc<FileDiff>),
+    /// A submodule pointer change: the commit range.
+    Submodule(SubmoduleDiff),
     Failed(String),
 }
 
@@ -195,6 +209,8 @@ pub struct DiffView {
     pub cancel: Option<CancellationToken>,
     /// Scroll back to the top when the next frame is laid out (a different file was opened).
     pub reset_scroll: bool,
+    /// Scroll the text diff to this offset on the next frame (the diff scroll benchmark).
+    pub scroll_to: Option<f32>,
     /// Swipe position (0..=1) and onion-skin opacity (0..=1) of the image comparison.
     pub swipe: f32,
     pub onion: f32,
@@ -208,6 +224,7 @@ impl Default for DiffView {
             generation: 0,
             cancel: None,
             reset_scroll: false,
+            scroll_to: None,
             swipe: 0.5,
             onion: 0.5,
         }

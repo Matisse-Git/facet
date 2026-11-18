@@ -4,22 +4,32 @@
 //! file dialogs, disk writes) runs elsewhere and reports back as an [`Event`] over a channel;
 //! the sender wakes the UI with `request_repaint`.
 
+use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use facet_git::askpass::{self, AskpassRequest};
 use facet_git::parse::GitVersion;
 use facet_git::{CancellationToken, CommandLog, CommandRecord, Git, GitError, Head, RepoInfo};
 
 use crate::actions::{shortcut, Action, Command, CommandContext, WorkContext, GLOBAL_SHORTCUTS};
+use crate::app_repo::NetworkOp;
+use crate::app_settings::{SettingsEvent, SettingsView};
+use crate::app_trees::LfsState;
 use crate::app_work::WorkEvent;
+use crate::history::{History, RefsState, View};
+use crate::integrations::Installed;
 use crate::platform::{self, Chrome};
+use crate::power::PowerState;
 use crate::settings::{same_path, Settings};
 use crate::theme::{self, Palette};
 use crate::ui::confirm::Confirm;
 use crate::ui::palette::PaletteState;
+use crate::ui::prompt::Prompt;
 use crate::ui::toast::{Toast, ToastKind};
 use crate::watcher::{IndexStamp, RepoWatcher};
 use crate::workspace::{Area, DiffBody, Workspace};
@@ -37,6 +47,12 @@ pub enum Event {
         result: Result<(RepoInfo, Head), GitError>,
     },
     SettingsSaved(Result<(), String>),
+    /// Git asks for a username, password or passphrase (G7).
+    Askpass(AskpassRequest),
+    /// Settings, integrations and second-launch hand-overs (see `app_settings.rs`).
+    Settings(SettingsEvent),
+    /// The Add Repository dialog: folder picks, finished clones and inits (`app_add.rs`).
+    AddRepo(crate::app_add::AddRepoEvent),
     /// Working copy results for one tab (see `app_work.rs`). `stamp` is the state of
     /// `.git/index` right after work that may have written it.
     Work {
@@ -72,6 +88,17 @@ pub struct RepoTab {
     pub(crate) ops: Arc<tokio::sync::Mutex<()>>,
     /// `.git/index` as Facet last left it, to tell its own writes from outside changes.
     pub(crate) index_stamp: IndexStamp,
+    /// Changes or History.
+    pub view: View,
+    /// Branches, tags, remotes, stashes.
+    pub refs: RefsState,
+    pub history: History,
+    /// The fetch / pull / push in flight (one per repository).
+    pub network: Option<NetworkOp>,
+    /// The operation in progress, undo points, search, blame, rebase and conflict editors.
+    pub power: PowerState,
+    /// Git LFS: usage, attributes of the listed files, locks.
+    pub lfs: LfsState,
 }
 
 impl RepoTab {
@@ -123,6 +150,20 @@ pub struct FacetApp {
     next_toast_id: u64,
     /// The question currently asked before a destructive action, if any.
     pub confirm: Option<Confirm>,
+    /// The text dialog currently open (new branch, stash message, credentials…).
+    pub prompt: Option<Prompt>,
+    /// The settings view, while open.
+    pub settings_view: Option<SettingsView>,
+    /// The Add Repository dialog, while open.
+    pub add_view: Option<crate::app_add::AddRepoView>,
+    /// The dialog's tab when it was last closed; it opens there again.
+    pub(crate) last_add_tab: crate::app_add::AddTab,
+    /// Programs found on this machine (terminal, editors, diff / merge tools).
+    pub(crate) installed: Installed,
+    /// Credential prompts from git, oldest first; the first is shown once no other dialog is.
+    pub(crate) askpass: VecDeque<AskpassRequest>,
+    /// A Windows notification is showing (cleared when the window is focused again).
+    pub(crate) notified: bool,
     /// Actions queued by views during a frame; run after the frame's UI is built.
     pub pending: Vec<Action>,
 
@@ -135,6 +176,10 @@ pub struct FacetApp {
     /// Which GPU adapter is rendering, for the startup trace.
     gpu: String,
     frames: u64,
+    /// `FACET_BENCH_SCROLL`: the history scroll measurement in progress.
+    bench: Option<crate::bench::ScrollBench>,
+    /// `FACET_BENCH_SEARCH`: the search to run once the history has loaded.
+    bench_search: Option<(facet_git::SearchKind, String)>,
 }
 
 impl FacetApp {
@@ -144,9 +189,11 @@ impl FacetApp {
         runtime: tokio::runtime::Runtime,
         startup: Instant,
         open_on_launch: Option<PathBuf>,
+        instance: Option<crate::instance::Server>,
     ) -> Self {
         let ctx = cc.egui_ctx.clone();
-        theme::install(&ctx, settings.theme);
+        theme::install(&ctx, settings.theme, settings.code_font);
+        ctx.set_zoom_factor(settings.ui_scale);
 
         let dark = ctx.theme() == egui::Theme::Dark;
         let chrome = Chrome::install(cc, dark);
@@ -159,8 +206,20 @@ impl FacetApp {
             let ctx = ctx.clone();
             command_log.set_listener(move || ctx.request_repaint());
         }
-        let git = Git::new("git", command_log.clone());
         let (events_tx, events_rx) = std::sync::mpsc::channel();
+        let git = credential_git(
+            Git::new(
+                settings
+                    .git_path
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("git")),
+                command_log.clone(),
+            ),
+            &runtime,
+            chrome,
+            &events_tx,
+            &ctx,
+        );
 
         let mut app = Self {
             saved_settings: settings.clone(),
@@ -182,6 +241,13 @@ impl FacetApp {
             toasts: Vec::new(),
             next_toast_id: 1,
             confirm: None,
+            prompt: None,
+            settings_view: None,
+            add_view: None,
+            last_add_tab: crate::app_add::AddTab::default(),
+            installed: Installed::default(),
+            askpass: VecDeque::new(),
+            notified: false,
             pending: Vec::new(),
             chrome,
             applied_dark: Some(dark),
@@ -197,9 +263,24 @@ impl FacetApp {
             was_focused: true,
             startup,
             frames: 0,
+            bench: crate::bench::ScrollBench::from_env(),
+            bench_search: crate::bench::search_from_env(),
         };
 
         app.check_git();
+        app.detect_integrations();
+        if let Some(server) = instance {
+            let (tx, ctx) = (app.events_tx.clone(), app.ctx.clone());
+            let _entered = app.runtime.enter();
+            crate::instance::serve(server, move |path| {
+                if tx
+                    .send(Event::Settings(SettingsEvent::Forwarded(path)))
+                    .is_ok()
+                {
+                    ctx.request_repaint();
+                }
+            });
+        }
         let restore: Vec<PathBuf> = app.settings.open_repos.clone();
         let active = app.settings.active_repo;
         for path in restore {
@@ -268,6 +349,9 @@ impl FacetApp {
                     self.error_toast("Couldn't save settings", Some(detail));
                 }
             }
+            Event::Askpass(request) => self.askpass.push_back(request),
+            Event::Settings(event) => self.handle_settings_event(event),
+            Event::AddRepo(event) => self.handle_add_event(event),
             Event::Work { tab, stamp, event } => self.handle_work_event(tab, stamp, event),
         }
     }
@@ -295,6 +379,12 @@ impl FacetApp {
             watcher: None,
             ops: Arc::default(),
             index_stamp: None,
+            view: View::default(),
+            refs: RefsState::default(),
+            history: History::default(),
+            network: None,
+            power: PowerState::default(),
+            lfs: LfsState::default(),
         });
         let index = self.tabs.len() - 1;
         if activate || self.active.is_none() {
@@ -415,17 +505,12 @@ impl FacetApp {
         }
     }
 
-    fn remove_tab(&mut self, index: usize) {
+    pub(crate) fn remove_tab(&mut self, index: usize) {
         if index >= self.tabs.len() {
             return;
         }
         let tab = self.tabs.remove(index);
-        if let Some(load) = tab.load {
-            load.cancel();
-        }
-        if let Some(diff) = tab.work.diff.cancel {
-            diff.cancel();
-        }
+        cancel_tab_work(&tab);
         self.active = match self.active {
             _ if self.tabs.is_empty() => None,
             Some(active) if active > index => Some(active - 1),
@@ -460,16 +545,23 @@ impl FacetApp {
     pub fn commands(&self) -> Vec<Command> {
         let names: Vec<String> = self.tabs.iter().map(RepoTab::name).collect();
         let work = self.work_context();
+        let repo = self.repo_context();
+        let open_in = self.installed.open_targets();
         crate::actions::commands(&CommandContext {
             tabs: &names,
             active_tab: self.active,
             repo_ready: self.active_tab().is_some_and(RepoTab::is_ready),
             work: work.as_ref(),
+            repo: repo.as_ref(),
             recent: &self.settings.recent_repos,
             theme: self.settings.theme,
             sidebar_visible: self.settings.sidebar_visible,
             command_log_visible: self.settings.command_log_visible,
             command_log_empty: self.command_log.is_empty(),
+            ui_scale: self.settings.ui_scale,
+            code_font: self.settings.code_font,
+            custom_git: self.settings.git_path.is_some(),
+            open_in: &open_in,
         })
     }
 
@@ -558,9 +650,16 @@ impl FacetApp {
                 theme::set_mode(&self.ctx, mode);
             }
             Action::Quit => self.ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-            // Everything else belongs to the working copy (`app_work.rs`).
+            // Everything else belongs to the working copy (`app_work.rs`) or to history,
+            // branches, remotes and stashes (`app_repo.rs`).
             work => {
-                let unhandled = self.run_work_action(work);
+                let unhandled = self
+                    .run_settings_action(work)
+                    .and_then(|other| self.run_add_action(other))
+                    .and_then(|other| self.run_work_action(other))
+                    .and_then(|other| self.run_repo_action(other))
+                    .and_then(|other| self.run_power_action(other))
+                    .and_then(|other| self.run_tree_action(other));
                 debug_assert!(unhandled.is_none(), "unhandled action {unhandled:?}");
             }
         }
@@ -639,8 +738,12 @@ impl FacetApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        // A confirmation dialog owns the keyboard entirely (it handles Enter and Escape).
-        if self.confirm.is_some() {
+        // A dialog owns the keyboard entirely (it handles Enter and Escape).
+        if self.confirm.is_some()
+            || self.prompt.is_some()
+            || self.add_view.is_some()
+            || self.power_modal_open()
+        {
             return;
         }
         for (shortcut, action) in GLOBAL_SHORTCUTS {
@@ -657,7 +760,46 @@ impl FacetApp {
     /// Keys of the file list and the diff. They apply while no widget has keyboard focus, so
     /// typing a commit message or tabbing through buttons never stages or discards anything.
     fn handle_work_keys(&mut self, ctx: &egui::Context) {
-        if self.palette.open || ctx.memory(|memory| memory.focused().is_some()) {
+        // The settings page covers the file list and the diff: their keys must not act on
+        // a selection nobody can see.
+        if self.palette.open
+            || self.settings_view.is_some()
+            || ctx.memory(|memory| memory.focused().is_some())
+        {
+            return;
+        }
+        // Escape leaves the blame view, then a filtered commit list.
+        let (blame, filtered) = self.active_tab().map_or((false, false), |tab| {
+            (
+                tab.power.blame.is_some(),
+                tab.view == View::History
+                    && (tab.history.filter.is_some() || tab.power.search.open),
+            )
+        });
+        if (blame || filtered)
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            self.pending.push(if blame {
+                Action::CloseBlame
+            } else {
+                Action::ClearFilter
+            });
+            return;
+        }
+        if self
+            .active_tab()
+            .is_some_and(|tab| tab.view == View::History)
+        {
+            let mut actions = Vec::new();
+            ctx.input_mut(|input| {
+                if input.consume_shortcut(&shortcut::NEXT_FILE) {
+                    actions.push(Action::SelectNextCommit);
+                }
+                if input.consume_shortcut(&shortcut::PREVIOUS_FILE) {
+                    actions.push(Action::SelectPreviousCommit);
+                }
+            });
+            self.pending.extend(actions);
             return;
         }
         let Some(work) = self.active_work() else {
@@ -743,10 +885,17 @@ impl FacetApp {
     /// watcher (which can miss events on network drives or when the OS buffer overflows).
     fn refresh_on_focus(&mut self, ctx: &egui::Context) {
         let focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
+        if focused && self.notified {
+            self.notified = false;
+            if let Some(chrome) = self.chrome {
+                platform::clear_notification(chrome.raw());
+            }
+        }
         if focused && !self.was_focused {
             if let Some(index) = self.active.filter(|i| self.tabs[*i].is_ready()) {
                 if self.active_work().is_some() {
                     self.request_status(index, false);
+                    self.request_refs(index);
                 } else {
                     self.load_tab(index);
                 }
@@ -807,6 +956,120 @@ impl FacetApp {
         }
     }
 
+    /// `FACET_BENCH_SCROLL`: show the history, then scroll it every frame and log frame times.
+    fn step_scroll_bench(&mut self, previous_cpu_secs: Option<f32>) {
+        if self.bench.is_none() && self.bench_search.is_none() {
+            return;
+        }
+        let Some(index) = self.active.filter(|index| {
+            self.tabs
+                .get(*index)
+                .is_some_and(|tab| crate::app_work::ready_info(tab).is_some())
+        }) else {
+            return;
+        };
+        if let Some(crate::bench::Target::Diff(path)) =
+            self.bench.as_ref().map(|bench| bench.target.clone())
+        {
+            self.step_diff_bench(index, &path, previous_cpu_secs);
+            return;
+        }
+        let tab = &mut self.tabs[index];
+        if tab.view != View::History {
+            self.pending.push(Action::ShowHistory);
+            return;
+        }
+        if !tab.history.loaded {
+            return;
+        }
+        // `FACET_BENCH_SEARCH`: search first, then scroll the results.
+        if let Some((kind, text)) = self.bench_search.take() {
+            tab.power.search.kind = kind;
+            tab.power.search.text = text;
+            tab.power.search.open = true;
+            self.pending.push(Action::RunSearch);
+            return;
+        }
+        let Some(bench) = &mut self.bench else {
+            return;
+        };
+        let history = &mut tab.history;
+        let height = history.commits.len() as f32 * crate::ui::COMMIT_ROW;
+        match bench.step(previous_cpu_secs, height) {
+            Some(offset) => {
+                history.scroll_to = Some(offset);
+                self.ctx.request_repaint();
+            }
+            None => {
+                let report = bench.report(&format!(
+                    "{} commits, {} lanes",
+                    history.commits.len(),
+                    history.max_lanes
+                ));
+                crate::app_work::perf_log(&report);
+                self.bench = None;
+                self.info_toast("Scroll benchmark finished (see FACET_PERF_LOG)");
+            }
+        }
+    }
+
+    /// `FACET_BENCH_SCROLL=diff:<path>`: open the working-copy diff of `path`, then scroll it
+    /// every frame and log frame times.
+    fn step_diff_bench(&mut self, index: usize, path: &str, previous_cpu_secs: Option<f32>) {
+        use crate::workspace::{Area, DiffBody};
+        let tab = &mut self.tabs[index];
+        if tab.view != View::Changes {
+            self.pending.push(Action::ShowChanges);
+            return;
+        }
+        let Some(bench) = &mut self.bench else {
+            return;
+        };
+        if !tab.work.loaded {
+            return;
+        }
+        let work = &mut tab.work;
+        if !bench.opened {
+            let found = [Area::Unstaged, Area::Staged].into_iter().find_map(|area| {
+                (0..work.list(area).len())
+                    .find(|&row| work.entry(area, row).is_some_and(|e| e.path == path))
+                    .map(|row| (area, row))
+            });
+            match found {
+                Some((area, row)) => {
+                    self.pending.push(Action::SelectFile {
+                        area,
+                        index: row,
+                        toggle: false,
+                        extend: false,
+                    });
+                    bench.opened = true;
+                }
+                None => {
+                    crate::app_work::perf_log(&format!("scroll bench: {path} has no changes\n"));
+                    self.bench = None;
+                }
+            }
+            return;
+        }
+        let DiffBody::Text(text) = &work.diff.body else {
+            return; // still loading
+        };
+        let rows = text.row_count();
+        match bench.step(previous_cpu_secs, rows as f32 * crate::ui::DIFF_LINE) {
+            Some(offset) => {
+                work.diff.scroll_to = Some(offset);
+                self.ctx.request_repaint();
+            }
+            None => {
+                let report = bench.report(&format!("diff of {path}, {rows} rows"));
+                crate::app_work::perf_log(&report);
+                self.bench = None;
+                self.info_toast("Scroll benchmark finished (see FACET_PERF_LOG)");
+            }
+        }
+    }
+
     /// Log time-to-first-frame when `FACET_STARTUP_LOG` names a file (used for profiling the
     /// cold-start budget). The second `ui` call means the first frame has been presented.
     fn trace_startup(&mut self) {
@@ -837,13 +1100,16 @@ impl eframe::App for FacetApp {
         self.persist_settings();
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.trace_startup();
+        self.step_scroll_bench(frame.info().cpu_usage);
         self.sync_appearance(&ctx);
+        self.sync_zoom(&ctx);
         self.handle_shortcuts(&ctx);
         self.handle_dropped_files(&ctx);
         self.refresh_on_focus(&ctx);
+        self.show_next_askpass();
 
         self.layout(ui);
 
@@ -859,17 +1125,74 @@ impl eframe::App for FacetApp {
 
     fn on_exit(&mut self) {
         for tab in &self.tabs {
-            if let Some(load) = &tab.load {
-                load.cancel();
-            }
-            if let Some(diff) = &tab.work.diff.cancel {
-                diff.cancel();
-            }
+            cancel_tab_work(tab);
+        }
+        // Prompts nobody will answer: let git fail instead of waiting.
+        for request in self.askpass.drain(..) {
+            request.answer(None);
+        }
+        if let Some(chrome) = self.chrome {
+            platform::clear_notification(chrome.raw());
         }
         self.capture_window_placement();
         if self.settings != self.saved_settings || self.settings_dirty_since.is_some() {
             let _ = self.settings.save();
         }
+    }
+}
+
+/// Git, set up so credential prompts reach the person (G7): Git Credential Manager's own
+/// windows open modal to Facet's window, and every other prompt (username without a helper,
+/// SSH passphrase, unknown host key) comes to Facet's prompt dialog through the askpass
+/// helper, which is Facet's own executable.
+fn credential_git(
+    git: Git,
+    runtime: &tokio::runtime::Runtime,
+    chrome: Option<Chrome>,
+    events: &Sender<Event>,
+    ctx: &egui::Context,
+) -> Git {
+    let mut vars: Vec<(OsString, OsString)> = Vec::new();
+    if let Some(chrome) = chrome {
+        vars.push((
+            "GCM_MODAL_PARENTHWND".into(),
+            chrome.raw().to_string().into(),
+        ));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let _entered = runtime.enter();
+        let (tx, ctx) = (events.clone(), ctx.clone());
+        // A request that can't be delivered is dropped, which cancels it: git then fails
+        // with its own message instead of waiting forever.
+        let started = askpass::start(&exe, move |request| {
+            if tx.send(Event::Askpass(request)).is_ok() {
+                ctx.request_repaint();
+            }
+        });
+        if let Ok(env) = started {
+            vars.extend(env.vars);
+        }
+    }
+    git.with_envs(&vars)
+}
+
+/// Stop everything still running for a tab that is going away (git processes die with their
+/// job objects, G6).
+fn cancel_tab_work(tab: &RepoTab) {
+    let tokens = [
+        tab.load.as_ref(),
+        tab.work.diff.cancel.as_ref(),
+        tab.history.cancel.as_ref(),
+        tab.history.commit.cancel.as_ref(),
+        tab.history.commit.diff.cancel.as_ref(),
+        tab.network.as_ref().map(|network| &network.cancel),
+        tab.power
+            .blame
+            .as_ref()
+            .and_then(|blame| blame.cancel.as_ref()),
+    ];
+    for token in tokens.into_iter().flatten() {
+        token.cancel();
     }
 }
 

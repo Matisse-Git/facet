@@ -20,6 +20,82 @@ pub const SIDEBAR_WIDTH: std::ops::RangeInclusive<f32> = 176.0..=480.0;
 pub const COMMAND_LOG_HEIGHT: std::ops::RangeInclusive<f32> = 96.0..=640.0;
 pub const CHANGES_WIDTH: std::ops::RangeInclusive<f32> = 240.0..=720.0;
 pub const COMMIT_BOX_HEIGHT: std::ops::RangeInclusive<f32> = 104.0..=480.0;
+pub const DETAIL_WIDTH: std::ops::RangeInclusive<f32> = 320.0..=1200.0;
+/// Sidebar sections that can be collapsed (by their title).
+pub const SIDEBAR_SECTIONS: [&str; 8] = [
+    "Branches",
+    "Remotes",
+    "Tags",
+    "Stashes",
+    "Worktrees",
+    "Submodules",
+    "Locks",
+    "Recent",
+];
+/// Interface sizes offered in settings (egui zoom factors). Ctrl+= / Ctrl+- / Ctrl+0 step
+/// through the same range.
+pub const UI_SCALES: [f32; 5] = [0.9, 1.0, 1.1, 1.25, 1.5];
+pub const UI_SCALE: std::ops::RangeInclusive<f32> = 0.5..=2.0;
+
+/// The typeface used for diffs, ids and command lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodeFont {
+    #[default]
+    CascadiaMono,
+    CascadiaCode,
+    Consolas,
+}
+
+impl CodeFont {
+    pub const ALL: [Self; 3] = [Self::CascadiaMono, Self::CascadiaCode, Self::Consolas];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::CascadiaMono => "Cascadia Mono",
+            Self::CascadiaCode => "Cascadia Code",
+            Self::Consolas => "Consolas",
+        }
+    }
+
+    /// The font file in `%WINDIR%\Fonts`.
+    pub fn file(self) -> &'static str {
+        match self {
+            Self::CascadiaMono => "CascadiaMono.ttf",
+            Self::CascadiaCode => "CascadiaCode.ttf",
+            Self::Consolas => "consola.ttf",
+        }
+    }
+}
+
+/// How "Pull" integrates the upstream's commits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PullMode {
+    /// Fast-forward only; never creates a merge commit.
+    #[default]
+    FastForwardOnly,
+    /// Rebase local commits onto the upstream.
+    Rebase,
+}
+
+impl PullMode {
+    pub const ALL: [Self; 2] = [Self::FastForwardOnly, Self::Rebase];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FastForwardOnly => "Fast-Forward Only",
+            Self::Rebase => "Rebase",
+        }
+    }
+
+    pub fn git(self) -> facet_git::PullMode {
+        match self {
+            Self::FastForwardOnly => facet_git::PullMode::FastForwardOnly,
+            Self::Rebase => facet_git::PullMode::Rebase,
+        }
+    }
+}
 
 /// How two versions of an image are compared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -78,6 +154,11 @@ pub struct Settings {
     /// Height of the commit message area under the file list.
     pub commit_box_height: f32,
     pub image_mode: ImageMode,
+    /// Width of the commit detail pane beside the history list.
+    pub detail_width: f32,
+    pub pull_mode: PullMode,
+    /// Collapsed sidebar sections (titles from [`SIDEBAR_SECTIONS`]).
+    pub collapsed_sections: Vec<String>,
     /// Repositories where the offer to enable `core.fsmonitor` / `core.untrackedCache` was
     /// declined; it is not shown there again.
     pub perf_offer_declined: Vec<PathBuf>,
@@ -87,6 +168,72 @@ pub struct Settings {
     pub open_repos: Vec<PathBuf>,
     pub active_repo: Option<usize>,
     pub window: Option<Placement>,
+    /// External diff / merge tools, chosen by file extension (first match wins).
+    pub external_tools: Vec<ExternalTool>,
+    /// The git executable; `None` finds `git` on `PATH`.
+    pub git_path: Option<PathBuf>,
+    /// Interface size (egui zoom factor; 1.0 is the design size).
+    pub ui_scale: f32,
+    pub code_font: CodeFont,
+}
+
+/// An external diff and/or merge tool for some file extensions. Commands are command lines
+/// with placeholders: `$LOCAL` and `$REMOTE` for a diff; `$BASE`, `$LOCAL`, `$REMOTE` and
+/// `$MERGED` for a merge.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExternalTool {
+    /// Lower-case extensions without the dot (`unity`, `prefab`); `*` matches every file.
+    pub extensions: Vec<String>,
+    pub diff: String,
+    pub merge: String,
+}
+
+impl ExternalTool {
+    fn matches(&self, extension: &str) -> bool {
+        self.extensions
+            .iter()
+            .any(|ext| ext == "*" || ext.eq_ignore_ascii_case(extension))
+    }
+
+    pub fn label(&self) -> String {
+        let extensions = self
+            .extensions
+            .iter()
+            .map(|ext| {
+                if ext == "*" {
+                    "all files".to_owned()
+                } else {
+                    format!(".{ext}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let program = facet_git::tools::split_command(if self.diff.is_empty() {
+            &self.merge
+        } else {
+            &self.diff
+        })
+        .into_iter()
+        .next()
+        .map(|program| {
+            program
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(&program)
+                .to_owned()
+        })
+        .unwrap_or_default();
+        format!("{program} ({extensions})")
+    }
+
+    /// Parse the extensions as typed: `unity, .prefab  asset` → `unity`, `prefab`, `asset`.
+    pub fn parse_extensions(text: &str) -> Vec<String> {
+        text.split([',', ' ', ';'])
+            .map(|ext| ext.trim().trim_start_matches('.').to_lowercase())
+            .filter(|ext| !ext.is_empty())
+            .collect()
+    }
 }
 
 impl Default for Settings {
@@ -100,16 +247,39 @@ impl Default for Settings {
             changes_width: 340.0,
             commit_box_height: 148.0,
             image_mode: ImageMode::default(),
+            detail_width: 520.0,
+            pull_mode: PullMode::default(),
+            collapsed_sections: Vec::new(),
             perf_offer_declined: Vec::new(),
             recent_repos: Vec::new(),
             open_repos: Vec::new(),
             active_repo: None,
             window: None,
+            external_tools: Vec::new(),
+            git_path: None,
+            ui_scale: 1.0,
+            code_font: CodeFont::default(),
         }
     }
 }
 
 impl Settings {
+    /// The command line of the external tool for `path` (a diff tool, or with `merge` a
+    /// merge tool): the first tool whose extensions match and that has that command.
+    pub fn external_tool(&self, path: &str, merge: bool) -> Option<&str> {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        let extension = name
+            .rsplit_once('.')
+            .filter(|(stem, _)| !stem.is_empty())
+            .map_or("", |(_, ext)| ext);
+        self.external_tools
+            .iter()
+            .filter(|tool| tool.matches(extension))
+            .map(|tool| if merge { &tool.merge } else { &tool.diff })
+            .find(|command| !command.trim().is_empty())
+            .map(String::as_str)
+    }
+
     /// Directory holding Facet's settings, or `None` if no location can be determined.
     pub fn config_dir() -> Option<PathBuf> {
         if let Some(dir) = std::env::var_os(CONFIG_DIR_ENV).filter(|v| !v.is_empty()) {
@@ -166,6 +336,19 @@ impl Settings {
         self.command_log_height = clamp_or(self.command_log_height, COMMAND_LOG_HEIGHT, 200.0);
         self.changes_width = clamp_or(self.changes_width, CHANGES_WIDTH, 340.0);
         self.commit_box_height = clamp_or(self.commit_box_height, COMMIT_BOX_HEIGHT, 148.0);
+        self.detail_width = clamp_or(self.detail_width, DETAIL_WIDTH, 520.0);
+        self.ui_scale = clamp_or(self.ui_scale, UI_SCALE, 1.0);
+        if self
+            .git_path
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            self.git_path = None;
+        }
+        self.collapsed_sections
+            .retain(|section| SIDEBAR_SECTIONS.contains(&section.as_str()));
+        self.collapsed_sections.sort_unstable();
+        self.collapsed_sections.dedup();
         self.recent_repos.truncate(MAX_RECENT);
         if self
             .active_repo
@@ -209,6 +392,47 @@ pub fn same_path(a: &Path, b: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_tools_are_chosen_by_extension() {
+        let mut settings = Settings::default();
+        assert!(settings.external_tool("a.unity", true).is_none());
+        settings.external_tools = vec![
+            ExternalTool {
+                extensions: ExternalTool::parse_extensions(".Unity, prefab"),
+                diff: String::new(),
+                merge: r#""C:\Tools\UnityYAMLMerge.exe" merge -p $BASE $REMOTE $LOCAL $MERGED"#
+                    .into(),
+            },
+            ExternalTool {
+                extensions: vec!["*".into()],
+                diff: "bcomp $LOCAL $REMOTE".into(),
+                merge: "bcomp $LOCAL $REMOTE $BASE $MERGED".into(),
+            },
+        ];
+        assert_eq!(
+            settings.external_tools[0].extensions,
+            vec!["unity", "prefab"]
+        );
+        assert!(settings
+            .external_tool("Assets/Main.UNITY", true)
+            .unwrap()
+            .contains("UnityYAMLMerge"));
+        // No diff command for .unity in the first tool: the catch-all one is used.
+        assert_eq!(
+            settings.external_tool("Assets/Main.unity", false),
+            Some("bcomp $LOCAL $REMOTE")
+        );
+        assert!(settings
+            .external_tool("Makefile", true)
+            .unwrap()
+            .starts_with("bcomp"));
+        assert_eq!(
+            settings.external_tools[0].label(),
+            "UnityYAMLMerge.exe (.unity, .prefab)"
+        );
+        assert_eq!(settings.external_tools[1].label(), "bcomp (all files)");
+    }
 
     #[test]
     fn missing_file_gives_defaults() {
@@ -270,13 +494,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(FILE_NAME),
-            r#"{ "sidebar_width": 5.0, "command_log_height": 99999.0, "active_repo": 3 }"#,
+            r#"{ "sidebar_width": 5.0, "command_log_height": 99999.0, "active_repo": 3,
+                 "detail_width": 1.0, "collapsed_sections": ["Tags", "Bogus", "Tags"],
+                 "pull_mode": "rebase", "ui_scale": 9.0, "git_path": "",
+                 "code_font": "consolas" }"#,
         )
         .unwrap();
         let settings = Settings::load_from(dir.path());
+        assert_eq!(settings.ui_scale, *UI_SCALE.end());
+        assert_eq!(settings.git_path, None);
+        assert_eq!(settings.code_font, CodeFont::Consolas);
         assert_eq!(settings.sidebar_width, *SIDEBAR_WIDTH.start());
         assert_eq!(settings.command_log_height, *COMMAND_LOG_HEIGHT.end());
         assert_eq!(settings.active_repo, None);
+        assert_eq!(settings.detail_width, *DETAIL_WIDTH.start());
+        assert_eq!(settings.collapsed_sections, ["Tags"]);
+        assert_eq!(settings.pull_mode, PullMode::Rebase);
     }
 
     #[test]

@@ -14,13 +14,14 @@ use facet_git::{
 
 use crate::actions::Action;
 use crate::app::{describe_error, Event, FacetApp, RepoTab, TabState};
+use crate::app_repo::RepoEvent;
 use crate::highlight::{decorate, display_text, Decorations};
 use crate::loader::{self, DiffPayload, LoadContext};
 use crate::settings::same_path;
 use crate::theme::Palette;
 use crate::ui::confirm::Confirm;
 use crate::watcher::{self, FsChange, IndexStamp};
-use crate::workspace::{Area, DiffBody, DiffKey, TextDiff, Workspace};
+use crate::workspace::{Area, DiffBody, DiffKey, DiffView, TextDiff, Workspace};
 
 /// The warm status budget from SPEC §2.4; refreshes slower than this count as slow.
 const STATUS_BUDGET_MS: u32 = 150;
@@ -42,10 +43,12 @@ pub enum WorkEvent {
         result: Result<StatusSnapshot, GitError>,
     },
     Diff {
+        slot: DiffSlot,
         generation: u64,
         result: Result<DiffPayload, GitError>,
     },
     Decorated {
+        slot: DiffSlot,
         generation: u64,
         decorations: Decorations,
     },
@@ -71,10 +74,33 @@ pub enum WorkEvent {
     },
     UndoList(Vec<UndoEntry>),
     Fs(FsChange),
+    /// History, branches, remotes, stashes (see `app_repo.rs`).
+    Repo(RepoEvent),
+}
+
+/// Which diff pane a load belongs to: the working copy's, or the history's commit detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffSlot {
+    Work,
+    Commit,
+}
+
+pub(crate) fn diff_view(tab: &RepoTab, slot: DiffSlot) -> &DiffView {
+    match slot {
+        DiffSlot::Work => &tab.work.diff,
+        DiffSlot::Commit => &tab.history.commit.diff,
+    }
+}
+
+pub(crate) fn diff_view_mut(tab: &mut RepoTab, slot: DiffSlot) -> &mut DiffView {
+    match slot {
+        DiffSlot::Work => &mut tab.work.diff,
+        DiffSlot::Commit => &mut tab.history.commit.diff,
+    }
 }
 
 /// Append a line to the file named by `FACET_PERF_LOG` (profiling aid; off by default).
-fn perf_log(line: &str) {
+pub(crate) fn perf_log(line: &str) {
     static TARGET: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     let target = TARGET.get_or_init(|| std::env::var_os("FACET_PERF_LOG").map(Into::into));
     if let Some(path) = target {
@@ -86,7 +112,7 @@ fn perf_log(line: &str) {
     }
 }
 
-fn ready_info(tab: &RepoTab) -> Option<&RepoInfo> {
+pub(crate) fn ready_info(tab: &RepoTab) -> Option<&RepoInfo> {
     match &tab.state {
         TabState::Ready { info, .. } if !info.is_bare() => Some(info),
         _ => None,
@@ -94,7 +120,7 @@ fn ready_info(tab: &RepoTab) -> Option<&RepoInfo> {
 }
 
 impl FacetApp {
-    fn tab_index(&self, id: u64) -> Option<usize> {
+    pub(crate) fn tab_index(&self, id: u64) -> Option<usize> {
         self.tabs.iter().position(|tab| tab.id == id)
     }
 
@@ -112,7 +138,7 @@ impl FacetApp {
 
     /// Run `work` for a tab on the runtime; its result (plus the index stamp afterwards, for
     /// work that may write the index) comes back as an event.
-    fn spawn_work(
+    pub(crate) fn spawn_work(
         &self,
         tab: &RepoTab,
         stamp_after: bool,
@@ -166,6 +192,9 @@ impl FacetApp {
                 Some(format!("{error}\nPress F5 to refresh manually.")),
             ),
         }
+
+        // Branches, tags, remotes and stashes for the sidebar (and the history's badges).
+        self.request_refs(index);
 
         let tab = &self.tabs[index];
         let git = self.git.clone();
@@ -288,6 +317,7 @@ impl FacetApp {
                 // A different current file always loads; the same one only when stale.
                 let stale = std::mem::take(&mut tab.work.diff_stale);
                 self.sync_diff(index, stale);
+                self.request_lfs_attributes(index);
             }
             Err(GitError::Cancelled) => {}
             Err(error) => {
@@ -301,12 +331,16 @@ impl FacetApp {
     }
 
     fn on_fs_change(&mut self, index: usize, change: FsChange) {
-        let tab = &self.tabs[index];
         // Facet's own writes are followed by a refresh anyway; so is an index write whose
         // result we have already seen.
-        if tab.work.busy > 0 {
+        if self.tabs[index].work.busy > 0 {
             return;
         }
+        // Branches, tags, stashes or HEAD moved (a commit, a fetch, another tool).
+        if change.refs {
+            self.request_refs(index);
+        }
+        let tab = &self.tabs[index];
         let own_index_write = change.index
             && !change.worktree
             && !change.refs
@@ -366,10 +400,16 @@ impl FacetApp {
         view.cancel = Some(cancel.clone());
         let generation = view.generation;
 
-        let (head_oid, index_oid) = tab
+        let (head_oid, index_oid, submodule) = tab
             .work
             .current()
-            .map(|(_, entry)| (entry.head_oid.clone(), entry.index_oid.clone()))
+            .map(|(_, entry)| {
+                (
+                    entry.head_oid.clone(),
+                    entry.index_oid.clone(),
+                    entry.submodule,
+                )
+            })
             .unwrap_or_default();
         let cx = LoadContext {
             git: self.git.clone(),
@@ -379,6 +419,7 @@ impl FacetApp {
             index_oid,
             ctx: self.ctx.clone(),
             cancel,
+            submodule,
         };
         let tab = &self.tabs[index];
         self.spawn_work(tab, false, async move {
@@ -396,13 +437,23 @@ impl FacetApp {
                     cx.request.path
                 ));
             }
-            WorkEvent::Diff { generation, result }
+            WorkEvent::Diff {
+                slot: DiffSlot::Work,
+                generation,
+                result,
+            }
         });
     }
 
-    fn on_diff(&mut self, index: usize, generation: u64, result: Result<DiffPayload, GitError>) {
+    pub(crate) fn on_diff(
+        &mut self,
+        index: usize,
+        slot: DiffSlot,
+        generation: u64,
+        result: Result<DiffPayload, GitError>,
+    ) {
         let tab = &mut self.tabs[index];
-        let view = &mut tab.work.diff;
+        let view = diff_view_mut(tab, slot);
         if generation != view.generation {
             return;
         }
@@ -416,24 +467,29 @@ impl FacetApp {
                 if let Some(text) = view.text().filter(|text| text.diff.data == diff.data) {
                     // The reload cancelled a decoration still in flight: start it again.
                     if text.decorations.is_none() {
-                        self.decorate(index);
+                        self.decorate(index, slot);
                     }
                     return;
                 }
-                let view = &mut self.tabs[index].work.diff;
+                let view = diff_view_mut(&mut self.tabs[index], slot);
                 let diff = Arc::new(diff);
                 if diff.hunks.is_empty() {
                     view.body = DiffBody::Unchanged(diff);
                     return;
                 }
                 // Renames and conflicts are staged per file; everything else per line.
+                // Commits of the history are read-only.
                 let partial = key.request.orig_path.is_none()
-                    && key.request.source != facet_git::DiffSource::Conflict;
+                    && !matches!(
+                        key.request.source,
+                        facet_git::DiffSource::Conflict | facet_git::DiffSource::Commit { .. }
+                    );
                 view.body = DiffBody::Text(TextDiff::new(diff, partial));
-                self.decorate(index);
+                self.decorate(index, slot);
             }
             Ok(DiffPayload::Binary(info)) => view.body = DiffBody::Binary(info),
             Ok(DiffPayload::Image(images)) => view.body = DiffBody::Image(images),
+            Ok(DiffPayload::Submodule(range)) => view.body = DiffBody::Submodule(range),
             Err(GitError::Cancelled) => {}
             Err(error) => {
                 view.body = DiffBody::Failed(describe_error(&error).1.unwrap_or_default())
@@ -442,12 +498,12 @@ impl FacetApp {
     }
 
     /// Compute syntax colors and word-level highlights for the text diff on a worker.
-    pub(crate) fn decorate(&mut self, index: usize) {
+    pub(crate) fn decorate(&mut self, index: usize, slot: DiffSlot) {
         let dark = Palette::of(&self.ctx).dark;
         let Some(tab) = self.tabs.get(index) else {
             return;
         };
-        let view = &tab.work.diff;
+        let view = diff_view(tab, slot);
         let (Some(text), Some(key), Some(_)) = (view.text(), &view.key, ready_info(tab)) else {
             return;
         };
@@ -470,12 +526,13 @@ impl FacetApp {
                 started.elapsed().as_millis()
             ));
             WorkEvent::Decorated {
+                slot,
                 generation,
                 decorations,
             }
         });
         if let Some(tab) = self.tabs.get_mut(index) {
-            if let Some(old) = tab.work.diff.cancel.replace(cancel) {
+            if let Some(old) = diff_view_mut(tab, slot).cancel.replace(cancel) {
                 old.cancel();
             }
         }
@@ -512,7 +569,7 @@ impl FacetApp {
 
     /// Bookkeeping shared by every finished operation: the repository changed under any
     /// status still in flight, so bump the epoch and refresh.
-    fn op_finished(&mut self, index: usize) {
+    pub(crate) fn op_finished(&mut self, index: usize) {
         let work = &mut self.tabs[index].work;
         work.busy = work.busy.saturating_sub(1);
         work.refresh.epoch += 1;
@@ -859,12 +916,17 @@ impl FacetApp {
                 elapsed_ms,
                 result,
             } => self.on_status(index, epoch, elapsed_ms, result),
-            WorkEvent::Diff { generation, result } => self.on_diff(index, generation, result),
+            WorkEvent::Diff {
+                slot,
+                generation,
+                result,
+            } => self.on_diff(index, slot, generation, result),
             WorkEvent::Decorated {
+                slot,
                 generation,
                 decorations,
             } => {
-                let view = &mut self.tabs[index].work.diff;
+                let view = diff_view_mut(&mut self.tabs[index], slot);
                 if generation == view.generation {
                     if let Some(text) = view.text_mut() {
                         if decorations.syntax.len() == text.diff.lines.len() {
@@ -892,6 +954,8 @@ impl FacetApp {
                         draft.error = None;
                         let verb = if amend { "Amended" } else { "Committed" };
                         self.info_toast(format!("{verb}: {subject}"));
+                        // The branch moved: the history and its badges follow.
+                        self.request_refs(index);
                     }
                     Ok(outcome) => {
                         draft.error = Some(if outcome.output.is_empty() {
@@ -976,6 +1040,7 @@ impl FacetApp {
             },
             WorkEvent::UndoList(entries) => self.tabs[index].work.undo = entries,
             WorkEvent::Fs(change) => self.on_fs_change(index, change),
+            WorkEvent::Repo(event) => self.handle_repo_event(index, event),
         }
     }
 
@@ -1178,7 +1243,8 @@ impl FacetApp {
     /// Syntax colors depend on the appearance: recompute them when it flips.
     pub(crate) fn redecorate_all(&mut self) {
         for index in 0..self.tabs.len() {
-            self.decorate(index);
+            self.decorate(index, DiffSlot::Work);
+            self.decorate(index, DiffSlot::Commit);
         }
     }
 }

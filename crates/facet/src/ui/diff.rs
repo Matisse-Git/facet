@@ -9,7 +9,7 @@ use eframe::egui::{
     text::LayoutJob, Align2, Color32, CornerRadius, CursorIcon, FontFamily, FontId, Id, Pos2, Rect,
     ScrollArea, Sense, TextFormat, Ui, Vec2,
 };
-use facet_git::parse::{EntryKind, FileDiff, LineKind};
+use facet_git::parse::{EntryKind, FileDiff, LineKind, LogCommit};
 use facet_git::DiffSource;
 
 use super::image_diff;
@@ -22,11 +22,12 @@ use crate::highlight::{display_text, Decorations, Span};
 use crate::settings::ImageMode;
 use crate::theme::{self, icon, radius, space, Palette};
 use crate::workspace::{
-    Area, BinaryInfo, DiffBody, DiffKey, DiffRow, LineDrag, TextDiff, Workspace,
+    Area, BinaryInfo, DiffBody, DiffKey, DiffRow, DiffView, LineDrag, SubmoduleDiff, TextDiff,
+    Workspace,
 };
 
-const HEADER_HEIGHT: f32 = 44.0;
-const LINE_HEIGHT: f32 = 20.0;
+pub(super) const HEADER_HEIGHT: f32 = 44.0;
+pub const LINE_HEIGHT: f32 = 20.0;
 /// Accent bar marking a selected line, at the gutter's left edge.
 const SELECT_BAR: f32 = 3.0;
 
@@ -48,25 +49,95 @@ impl FacetApp {
         widgets::hairline_h(ui, rect.x_range().into(), header.bottom());
 
         let body = Rect::from_min_max(Pos2::new(rect.left(), header.bottom() + 1.0), rect.max);
-        let reset = std::mem::take(&mut work.diff.reset_scroll);
-        let view = &mut work.diff;
-        match &mut view.body {
-            DiffBody::None | DiffBody::Loading => text_skeleton(ui, body),
-            DiffBody::Failed(message) => {
-                message_view(ui, body, "Couldn't show this diff", message);
-            }
-            DiffBody::Unchanged(diff) => {
-                let (title, detail) = unchanged_text(diff);
-                message_view(ui, body, title, &detail);
-            }
-            DiffBody::Binary(info) => binary_view(ui, body, info),
-            DiffBody::Image(images) => region(ui, "image-diff", body, |ui| {
-                image_diff::show(ui, body, images, mode, &mut view.swipe, &mut view.onion);
-            }),
-            DiffBody::Text(text) => region(ui, "text-diff", body, |ui| {
-                text_view(ui, body, text, key.area, reset, actions);
-            }),
+        diff_body(ui, body, &mut work.diff, key.area, mode, actions);
+    }
+}
+
+/// The diff itself (text, image comparison, binary card or a message), below a header.
+/// Shared by the working copy and the history's commit detail.
+pub(super) fn diff_body(
+    ui: &mut Ui,
+    body: Rect,
+    view: &mut DiffView,
+    area: Area,
+    mode: ImageMode,
+    actions: &mut Vec<Action>,
+) {
+    // A different file opened: back to the top. The benchmark scrolls to a given offset.
+    let reset = std::mem::take(&mut view.reset_scroll);
+    let scroll_to = view.scroll_to.take().or(reset.then_some(0.0));
+    match &mut view.body {
+        DiffBody::None | DiffBody::Loading => text_skeleton(ui, body),
+        DiffBody::Failed(message) => {
+            message_view(ui, body, "Couldn't show this diff", message);
         }
+        DiffBody::Unchanged(diff) => {
+            let (title, detail) = unchanged_text(diff);
+            message_view(ui, body, title, &detail);
+        }
+        DiffBody::Binary(info) => binary_view(ui, body, info),
+        DiffBody::Submodule(range) => region(ui, "submodule-diff", body, |ui| {
+            submodule_view(ui, range);
+        }),
+        DiffBody::Image(images) => region(ui, "image-diff", body, |ui| {
+            image_diff::show(ui, body, images, mode, &mut view.swipe, &mut view.onion);
+        }),
+        DiffBody::Text(text) => region(ui, "text-diff", body, |ui| {
+            text_view(ui, body, text, area, scroll_to, actions);
+        }),
+    }
+}
+
+/// A plain header for a diff that has no actions (a file of a commit): name, counts, folder.
+pub(super) fn plain_diff_header(ui: &Ui, rect: Rect, view: &DiffView) {
+    let Some(key) = &view.key else {
+        return;
+    };
+    let palette = Palette::of(ui.ctx());
+    let center = rect.center().y;
+    let room = |x: f32| (rect.right() - space::M - x).max(0.0);
+    let (dir, name) = file_name(&key.request.path);
+    let mut x = rect.left() + space::M;
+    x += text_line(
+        ui,
+        Pos2::new(x, center),
+        name,
+        theme::strong(),
+        palette.text,
+        room(x),
+    );
+    x += space::S;
+    if let Some(text) = view.text() {
+        for (count, sign, color) in [
+            (text.diff.added, '+', palette.success),
+            (text.diff.removed, '−', palette.danger),
+        ] {
+            if count > 0 && room(x) > 24.0 {
+                x += text_line(
+                    ui,
+                    Pos2::new(x, center),
+                    &format!("{sign}{count}"),
+                    theme::small_strong(),
+                    color,
+                    room(x),
+                ) + space::XS;
+            }
+        }
+        x += space::XS;
+    }
+    let detail = match &key.request.orig_path {
+        Some(orig) => format!("renamed from {orig}"),
+        None => dir.to_owned(),
+    };
+    if !detail.is_empty() && room(x) > 24.0 {
+        text_line(
+            ui,
+            Pos2::new(x, center),
+            &detail,
+            theme::small(),
+            palette.text_tertiary,
+            room(x),
+        );
     }
 }
 
@@ -206,6 +277,35 @@ fn diff_header(
                     false,
                     Action::StagePaths(vec![path.clone()]),
                 );
+                if entry.conflict.is_some() {
+                    add(
+                        "Resolve…",
+                        "Pick a side for each conflict, one by one".to_owned(),
+                        palette.text,
+                        false,
+                        Action::ResolveConflicts(path.clone()),
+                    );
+                    add(
+                        "Theirs",
+                        "Take the incoming version of the whole file".to_owned(),
+                        palette.text_secondary,
+                        false,
+                        Action::TakeSide {
+                            path: path.clone(),
+                            side: facet_git::conflict::Side::Theirs,
+                        },
+                    );
+                    add(
+                        "Ours",
+                        "Keep the current branch's version of the whole file".to_owned(),
+                        palette.text_secondary,
+                        false,
+                        Action::TakeSide {
+                            path: path.clone(),
+                            side: facet_git::conflict::Side::Ours,
+                        },
+                    );
+                }
                 if entry.kind != EntryKind::Unmerged && !entry.submodule {
                     add(
                         "Discard File…",
@@ -280,11 +380,12 @@ fn diff_header(
         }
         x += space::XS;
     }
-    let source = match key.request.source {
+    let source = match &key.request.source {
         DiffSource::Staged => "Staged",
         DiffSource::Unstaged => "Unstaged",
         DiffSource::Untracked => "Untracked",
         DiffSource::Conflict => "Conflict",
+        DiffSource::Commit { .. } => "Commit",
     };
     let mut detail = source.to_owned();
     if let Some(orig) = &key.request.orig_path {
@@ -431,6 +532,144 @@ fn binary_view(ui: &Ui, rect: Rect, info: &BinaryInfo) {
     }
 }
 
+/// A submodule pointer change: where it moved, then the commits it brings in and drops.
+fn submodule_view(ui: &mut Ui, range: &SubmoduleDiff) {
+    const ROW: f32 = 26.0;
+    enum Line<'a> {
+        Title(String),
+        Note(&'a str),
+        Section(String),
+        Commit(&'a LogCommit, bool),
+    }
+    let short = |oid: &str| oid.chars().take(7).collect::<String>();
+    let mut lines = vec![Line::Title(match (&range.old, &range.new) {
+        (Some(old), Some(new)) if old == new => format!("Submodule at {}", short(new)),
+        (Some(old), Some(new)) => format!("Submodule moved from {} to {}", short(old), short(new)),
+        (None, Some(new)) => format!("Submodule added at {}", short(new)),
+        (Some(old), None) => format!("Submodule removed (was at {})", short(old)),
+        (None, None) => "Submodule not checked out".to_owned(),
+    })];
+    if let Some(note) = &range.unavailable {
+        lines.push(Line::Note(note));
+    }
+    for (commits, added) in [(&range.added, true), (&range.removed, false)] {
+        if commits.is_empty() {
+            continue;
+        }
+        let count = commits.len();
+        let noun = if count == 1 { "commit" } else { "commits" };
+        let more = if count >= 500 { " (first 500)" } else { "" };
+        lines.push(Line::Section(if added {
+            format!("{count} {noun} added{more}")
+        } else {
+            format!("{count} {noun} removed{more}")
+        }));
+        lines.extend(commits.iter().map(|commit| Line::Commit(commit, added)));
+    }
+
+    let palette = Palette::of(ui.ctx());
+    let now = crate::format::unix_seconds(std::time::SystemTime::now());
+    ScrollArea::vertical()
+        .id_salt("submodule-scroll")
+        .auto_shrink(false)
+        .show_rows(ui, ROW, lines.len(), |ui, rows| {
+            let left = ui.max_rect().left() + space::M;
+            let right = ui.max_rect().right() - space::M;
+            let top = ui.max_rect().top() - rows.start as f32 * ROW + space::S;
+            for index in rows {
+                let center = top + index as f32 * ROW + ROW / 2.0;
+                let room = |x: f32| (right - x).max(0.0);
+                match &lines[index] {
+                    Line::Title(text) => {
+                        text_line(
+                            ui,
+                            Pos2::new(left, center),
+                            text,
+                            theme::strong(),
+                            palette.text,
+                            room(left),
+                        );
+                    }
+                    Line::Note(text) => {
+                        text_line(
+                            ui,
+                            Pos2::new(left, center),
+                            text,
+                            theme::small(),
+                            palette.warning,
+                            room(left),
+                        );
+                    }
+                    Line::Section(text) => {
+                        text_line(
+                            ui,
+                            Pos2::new(left, center + 4.0),
+                            text,
+                            theme::small_strong(),
+                            palette.text_tertiary,
+                            room(left),
+                        );
+                    }
+                    Line::Commit(commit, added) => {
+                        let (sign, color) = if *added {
+                            ('+', palette.success)
+                        } else {
+                            ('−', palette.danger)
+                        };
+                        ui.painter().text(
+                            Pos2::new(left + 4.0, center),
+                            Align2::CENTER_CENTER,
+                            sign,
+                            theme::small_strong(),
+                            color,
+                        );
+                        let mut x = left + space::M;
+                        x += text_line(
+                            ui,
+                            Pos2::new(x, center),
+                            &commit.short_oid(),
+                            theme::mono(),
+                            palette.text_secondary,
+                            room(x),
+                        ) + space::S;
+                        let meta = format!(
+                            "{} · {}",
+                            commit.author,
+                            crate::format::relative_time(now, commit.time)
+                        );
+                        let meta_width = widgets::elided(
+                            ui,
+                            &meta,
+                            theme::small(),
+                            palette.text_tertiary,
+                            f32::INFINITY,
+                        )
+                        .size()
+                        .x;
+                        let subject_room = (room(x) - meta_width - space::M).max(room(x) * 0.5);
+                        let width = text_line(
+                            ui,
+                            Pos2::new(x, center),
+                            &commit.subject,
+                            theme::body(),
+                            palette.text,
+                            subject_room,
+                        );
+                        x += width + space::M;
+                        text_line(
+                            ui,
+                            Pos2::new(x, center),
+                            &meta,
+                            theme::small(),
+                            palette.text_tertiary,
+                            room(x),
+                        );
+                    }
+                }
+            }
+        });
+}
+
 /// The text diff: virtualized rows, a sticky gutter with line numbers, and (when the diff
 /// supports partial staging) click / drag line selection and per-hunk actions.
 fn text_view(
@@ -438,7 +677,7 @@ fn text_view(
     rect: Rect,
     text: &mut TextDiff,
     area: Area,
-    reset: bool,
+    scroll_to: Option<f32>,
     actions: &mut Vec<Action>,
 ) {
     let palette = Palette::of(ui.ctx());
@@ -466,8 +705,8 @@ fn text_view(
     let mut scroll = ScrollArea::both()
         .id_salt("diff-text-scroll")
         .auto_shrink(false);
-    if reset {
-        scroll = scroll.scroll_offset(Vec2::ZERO);
+    if let Some(y) = scroll_to {
+        scroll = scroll.scroll_offset(Vec2::new(0.0, y));
     }
     let _ = rect;
     scroll.show_viewport(ui, |ui, viewport| {

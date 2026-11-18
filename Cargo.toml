@@ -10,7 +10,7 @@ license = "UNLICENSED"
 publish = false
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "sync", "time", "macros", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "sync", "time", "macros", "fs", "net"] }
 tokio-util = "0.7"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

@@ -10,10 +10,10 @@ use eframe::egui::{
     Stroke, TextStyle, Theme,
 };
 
-use crate::settings::ThemeMode;
+use crate::settings::{CodeFont, ThemeMode};
 
 /// Height of the custom title bar, in logical points.
-pub const TITLE_BAR_HEIGHT: f32 = 40.0;
+pub const TITLE_BAR_HEIGHT: f32 = 48.0;
 /// Height of a standard list row / control, in logical points.
 pub const ROW_HEIGHT: f32 = 32.0;
 
@@ -31,6 +31,8 @@ pub mod radius {
     pub const S: u8 = 4;
     pub const M: u8 = 6;
     pub const L: u8 = 10;
+    /// The content layer's top-left corner and cards (settings sections, dialog fields).
+    pub const LAYER: u8 = 8;
 }
 
 /// Motion: short, ease-out, never bouncy.
@@ -49,7 +51,6 @@ pub mod motion {
 
 /// Glyphs from Segoe Fluent Icons (ships with Windows 11).
 pub mod icon {
-    pub const SIDEBAR: char = '\u{E700}';
     pub const ADD: char = '\u{E710}';
     pub const CLOSE: char = '\u{E711}';
     pub const SEARCH: char = '\u{E721}';
@@ -61,10 +62,31 @@ pub mod icon {
     pub const ERROR: char = '\u{E783}';
     pub const INFO: char = '\u{E946}';
     pub const CHEVRON_DOWN: char = '\u{E70D}';
+    pub const CHEVRON_UP: char = '\u{E70E}';
+    /// GripperBarHorizontal: a drag handle.
+    pub const GRIPPER: char = '\u{E76F}';
+    pub const CHEVRON_RIGHT: char = '\u{E76C}';
     pub const REMOVE: char = '\u{E738}';
     pub const UNDO: char = '\u{E7A7}';
     pub const CHECK: char = '\u{E73E}';
     pub const DOCUMENT: char = '\u{E8A5}';
+    pub const LOCK: char = '\u{E72E}';
+    pub const UNLOCK: char = '\u{E785}';
+    pub const SETTINGS: char = '\u{E713}';
+    /// OpenInNewWindow.
+    pub const OPEN_IN: char = '\u{E8A7}';
+    /// Sync (two arrows in a circle).
+    pub const SYNC: char = '\u{E895}';
+    /// BranchFork2.
+    pub const BRANCH: char = '\u{F003}';
+    /// Page: the Changes view.
+    pub const CHANGES: char = '\u{E8A5}';
+    /// Recent (clock): the History view.
+    pub const HISTORY: char = '\u{E81C}';
+    /// Download: Clone.
+    pub const DOWNLOAD: char = '\u{E896}';
+    /// NewFolder: New repository.
+    pub const NEW_FOLDER: char = '\u{E8F4}';
 }
 
 const FAMILY_SEMIBOLD: &str = "facet-semibold";
@@ -96,6 +118,11 @@ pub fn title() -> FontId {
     FontId::new(28.0, FontFamily::Name(FAMILY_DISPLAY.into()))
 }
 
+/// Dialog and card titles.
+pub fn heading() -> FontId {
+    FontId::new(20.0, FontFamily::Name(FAMILY_DISPLAY.into()))
+}
+
 /// Code, object ids, command lines.
 pub fn mono() -> FontId {
     FontId::new(13.0, FontFamily::Monospace)
@@ -113,6 +140,8 @@ pub struct Palette {
     /// Solid surface for content areas (lists, diffs, detail views). Chrome areas (title bar,
     /// sidebar) are left transparent so the Mica backdrop shows through.
     pub surface: Color32,
+    /// The quieter second surface inside content (file list column, settings cards).
+    pub surface_alt: Color32,
     /// Surface for things that float above content: palette, toasts, tooltips.
     pub raised: Color32,
     /// 1px dividers and outlines.
@@ -159,56 +188,58 @@ const fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color32 {
 
 pub const DARK: Palette = Palette {
     dark: true,
-    surface: Color32::from_rgb(0x1A, 0x1A, 0x1C),
-    raised: Color32::from_rgb(0x2B, 0x2B, 0x2E),
-    hairline: rgba(255, 255, 255, 22),
-    text: Color32::from_rgb(0xF2, 0xF2, 0xF4),
-    text_secondary: rgba(0xF2, 0xF2, 0xF4, 160),
-    text_tertiary: rgba(0xF2, 0xF2, 0xF4, 96),
-    accent: Color32::from_rgb(0x0A, 0x84, 0xFF),
-    on_accent: Color32::WHITE,
-    accent_soft: rgba(0x0A, 0x84, 0xFF, 64),
-    hover: rgba(255, 255, 255, 15),
+    surface: Color32::from_rgb(0x1C, 0x1C, 0x1C),
+    surface_alt: Color32::from_rgb(0x24, 0x24, 0x24),
+    raised: Color32::from_rgb(0x2B, 0x2B, 0x2B),
+    hairline: Color32::from_rgb(0x32, 0x32, 0x32),
+    text: Color32::from_rgb(0xF2, 0xF2, 0xF2),
+    text_secondary: Color32::from_rgb(0xC4, 0xC4, 0xC4),
+    text_tertiary: Color32::from_rgb(0xA3, 0xA3, 0xA3),
+    accent: Color32::from_rgb(0x60, 0xCD, 0xFF),
+    on_accent: Color32::from_rgb(0x00, 0x26, 0x3F),
+    accent_soft: rgba(0x60, 0xCD, 0xFF, 36),
+    hover: rgba(255, 255, 255, 16),
     pressed: rgba(255, 255, 255, 26),
-    danger: Color32::from_rgb(0xFF, 0x45, 0x3A),
-    success: Color32::from_rgb(0x30, 0xD1, 0x58),
-    warning: Color32::from_rgb(0xFF, 0xD6, 0x0A),
+    danger: Color32::from_rgb(0xFF, 0x9C, 0x8F),
+    success: Color32::from_rgb(0x6C, 0xCB, 0x8A),
+    warning: Color32::from_rgb(0xF2, 0xC6, 0x61),
     skeleton: rgba(255, 255, 255, 14),
     skeleton_highlight: rgba(255, 255, 255, 30),
-    scrim: rgba(0, 0, 0, 96),
-    shadow: rgba(0, 0, 0, 110),
-    diff_added: rgba(0x30, 0xD1, 0x58, 34),
-    diff_added_strong: rgba(0x30, 0xD1, 0x58, 92),
-    diff_removed: rgba(0xFF, 0x45, 0x3A, 38),
-    diff_removed_strong: rgba(0xFF, 0x45, 0x3A, 104),
-    diff_hunk: rgba(0x0A, 0x84, 0xFF, 28),
+    scrim: rgba(0, 0, 0, 110),
+    shadow: rgba(0, 0, 0, 128),
+    diff_added: rgba(0x2E, 0xA0, 0x43, 33),
+    diff_added_strong: rgba(0x2E, 0xA0, 0x43, 97),
+    diff_removed: rgba(0xF8, 0x51, 0x49, 31),
+    diff_removed_strong: rgba(0xF8, 0x51, 0x49, 92),
+    diff_hunk: rgba(0x60, 0xCD, 0xFF, 24),
 };
 
 pub const LIGHT: Palette = Palette {
     dark: false,
     surface: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+    surface_alt: Color32::from_rgb(0xF9, 0xF9, 0xF9),
     raised: Color32::from_rgb(0xFF, 0xFF, 0xFF),
-    hairline: rgba(0, 0, 0, 24),
-    text: Color32::from_rgb(0x1C, 0x1C, 0x1E),
-    text_secondary: rgba(0x1C, 0x1C, 0x1E, 168),
-    text_tertiary: rgba(0x1C, 0x1C, 0x1E, 104),
-    accent: Color32::from_rgb(0x00, 0x6F, 0xE6),
+    hairline: Color32::from_rgb(0xE5, 0xE5, 0xE5),
+    text: Color32::from_rgb(0x1A, 0x1A, 0x1A),
+    text_secondary: Color32::from_rgb(0x5C, 0x5C, 0x5C),
+    text_tertiary: Color32::from_rgb(0x6B, 0x6B, 0x6B),
+    accent: Color32::from_rgb(0x00, 0x67, 0xC0),
     on_accent: Color32::WHITE,
-    accent_soft: rgba(0x00, 0x6F, 0xE6, 40),
-    hover: rgba(0, 0, 0, 12),
-    pressed: rgba(0, 0, 0, 22),
-    danger: Color32::from_rgb(0xD7, 0x2C, 0x22),
-    success: Color32::from_rgb(0x1F, 0x9D, 0x45),
-    warning: Color32::from_rgb(0xC7, 0x7A, 0x00),
+    accent_soft: rgba(0x00, 0x67, 0xC0, 26),
+    hover: rgba(0, 0, 0, 20),
+    pressed: rgba(0, 0, 0, 30),
+    danger: Color32::from_rgb(0xC4, 0x2B, 0x1C),
+    success: Color32::from_rgb(0x0F, 0x7B, 0x3F),
+    warning: Color32::from_rgb(0x8A, 0x5A, 0x00),
     skeleton: rgba(0, 0, 0, 14),
     skeleton_highlight: rgba(0, 0, 0, 28),
-    scrim: rgba(0, 0, 0, 46),
-    shadow: rgba(0, 0, 0, 50),
-    diff_added: rgba(0x1F, 0x9D, 0x45, 30),
-    diff_added_strong: rgba(0x1F, 0x9D, 0x45, 80),
-    diff_removed: rgba(0xD7, 0x2C, 0x22, 26),
-    diff_removed_strong: rgba(0xD7, 0x2C, 0x22, 72),
-    diff_hunk: rgba(0x00, 0x6F, 0xE6, 18),
+    scrim: rgba(0, 0, 0, 56),
+    shadow: rgba(0, 0, 0, 40),
+    diff_added: rgba(0x2E, 0xA0, 0x43, 26),
+    diff_added_strong: rgba(0x2E, 0xA0, 0x43, 72),
+    diff_removed: rgba(0xE5, 0x3E, 0x2E, 22),
+    diff_removed_strong: rgba(0xE5, 0x3E, 0x2E, 62),
+    diff_hunk: rgba(0x00, 0x67, 0xC0, 18),
 };
 
 impl Palette {
@@ -241,8 +272,8 @@ pub fn set_mode(ctx: &egui::Context, mode: ThemeMode) {
 }
 
 /// Install fonts and both styles. Call once at startup.
-pub fn install(ctx: &egui::Context, mode: ThemeMode) {
-    ctx.set_fonts(fonts());
+pub fn install(ctx: &egui::Context, mode: ThemeMode, code_font: CodeFont) {
+    ctx.set_fonts(font_definitions(code_font));
     ctx.style_mut_of(Theme::Dark, |style| configure(style, &DARK));
     ctx.style_mut_of(Theme::Light, |style| configure(style, &LIGHT));
     set_mode(ctx, mode);
@@ -308,9 +339,10 @@ fn configure(style: &mut egui::Style, palette: &Palette) {
     }
 }
 
-/// Segoe UI Variable for text, Segoe Fluent Icons for glyphs, Cascadia Mono for code, with
-/// egui's bundled fonts kept as a last-resort fallback if a system font is missing.
-fn fonts() -> FontDefinitions {
+/// Segoe UI Variable for text, Segoe Fluent Icons for glyphs, `code_font` (falling back to the
+/// other code fonts) for code, with egui's bundled fonts kept as a last-resort fallback if a
+/// system font is missing. Reads the font files: call it off the UI thread after startup.
+pub fn font_definitions(code_font: CodeFont) -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
     let dir = std::env::var_os("WINDIR")
         .map(std::path::PathBuf::from)
@@ -366,7 +398,13 @@ fn fonts() -> FontDefinitions {
             icon_chain.push(file.to_owned());
         }
     }
-    for file in ["CascadiaMono.ttf", "consola.ttf"] {
+    // The chosen font, then Consolas (always installed). Only two are loaded: font data stays
+    // resident for the life of the process.
+    let mut code_files = vec![code_font.file()];
+    if code_font != CodeFont::Consolas {
+        code_files.push(CodeFont::Consolas.file());
+    }
+    for file in code_files {
         if let Some(mut mono) = load(file) {
             // Cascadia is a variable font and reads heavy at small sizes on dark surfaces;
             // SemiLight keeps code and ids crisp. (Ignored by the static Consolas fallback.)

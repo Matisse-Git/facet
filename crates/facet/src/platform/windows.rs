@@ -439,6 +439,24 @@ pub fn reveal_in_explorer(path: &Path) -> std::io::Result<()> {
         .map(|_| ())
 }
 
+/// Give freed heap memory back to the system, off the calling thread. Rust's allocator uses
+/// the process heap, which keeps freed blocks committed; after a large list is read or freed
+/// (100k commits are half a million small allocations, plus the parse buffers) that memory
+/// would otherwise stay in Facet's private bytes.
+pub fn release_free_memory() {
+    std::thread::spawn(compact_heap);
+}
+
+/// [`release_free_memory`] on the calling thread (for a thread that has just freed a lot).
+pub fn compact_heap() {
+    use windows::Win32::System::Memory::{GetProcessHeap, HeapCompact, HEAP_FLAGS};
+    // SAFETY: compacting the process heap only coalesces and decommits free blocks; it is
+    // safe while other threads allocate (the heap is serialized).
+    if let Ok(heap) = unsafe { GetProcessHeap() } {
+        unsafe { HeapCompact(heap, HEAP_FLAGS(0)) };
+    }
+}
+
 /// The local time zone's current offset from UTC, in seconds (east of UTC is positive).
 pub fn local_utc_offset_seconds() -> i64 {
     const TIME_ZONE_ID_DAYLIGHT: u32 = 2;
@@ -452,4 +470,183 @@ pub fn local_utc_offset_seconds() -> i64 {
             info.StandardBias
         };
     -i64::from(bias_minutes) * 60
+}
+
+/// Open a web page in the default browser. Only `https://` URLs are accepted: the links come
+/// from remote URLs in the repository's config, which must not be able to launch programs.
+pub fn open_url(url: &str) -> std::io::Result<()> {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    if !url.starts_with("https://") || url.chars().any(|c| c.is_control() || c == ' ') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("not a web link: {url}"),
+        ));
+    }
+    // SAFETY: all strings are valid, NUL-terminated HSTRINGs that outlive the call.
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            &HSTRING::from("open"),
+            &HSTRING::from(url),
+            None,
+            None,
+            SW_SHOWNORMAL,
+        )
+    };
+    // ShellExecute reports success with a value greater than 32.
+    if result.0 as isize > 32 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// The notification-area icon that carries Facet's notifications exists.
+static NOTIFY_ICON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+const NOTIFY_ID: u32 = 0xFAC7;
+
+fn copy_wide(target: &mut [u16], text: &str) {
+    let mut len = 0;
+    for (slot, unit) in target.iter_mut().zip(text.encode_utf16()) {
+        *slot = unit;
+        len += 1;
+    }
+    let end = len.min(target.len() - 1);
+    target[end] = 0;
+}
+
+/// Show a Windows notification (a toast on Windows 10/11) for `owner`'s window: used when a
+/// long operation finishes while Facet is in the background. A temporary notification-area
+/// icon carries it; [`clear_notification`] removes it when the window is focused again.
+pub fn notify(owner: isize, title: &str, body: &str) -> bool {
+    use windows::Win32::UI::Shell::{
+        Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_MODIFY,
+        NOTIFYICONDATAW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        LoadIconW, SendMessageW, HICON, ICON_BIG, IDI_APPLICATION, WM_GETICON,
+    };
+    let hwnd = HWND(owner as *mut c_void);
+    // SAFETY: plain Win32 calls with a structure we own; the window handle is Facet's own.
+    unsafe {
+        let icon = SendMessageW(hwnd, WM_GETICON, Some(WPARAM(ICON_BIG as usize)), None);
+        let icon = if icon.0 != 0 {
+            HICON(icon.0 as *mut c_void)
+        } else {
+            LoadIconW(None, IDI_APPLICATION).unwrap_or_default()
+        };
+        let mut data = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: hwnd,
+            uID: NOTIFY_ID,
+            uFlags: NIF_ICON | NIF_TIP | NIF_INFO,
+            hIcon: icon,
+            dwInfoFlags: NIIF_INFO,
+            ..Default::default()
+        };
+        copy_wide(&mut data.szTip, "Facet");
+        copy_wide(&mut data.szInfoTitle, title);
+        copy_wide(&mut data.szInfo, body);
+        let message = if NOTIFY_ICON.swap(true, Ordering::SeqCst) {
+            NIM_MODIFY
+        } else {
+            NIM_ADD
+        };
+        let shown = Shell_NotifyIconW(message, &data).as_bool();
+        if !shown {
+            NOTIFY_ICON.store(false, Ordering::SeqCst);
+        }
+        shown
+    }
+}
+
+/// Remove the notification icon added by [`notify`], if any.
+pub fn clear_notification(owner: isize) {
+    use windows::Win32::UI::Shell::{Shell_NotifyIconW, NIM_DELETE, NOTIFYICONDATAW};
+    if !NOTIFY_ICON.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    let data = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: HWND(owner as *mut c_void),
+        uID: NOTIFY_ID,
+        ..Default::default()
+    };
+    // SAFETY: deletes the icon this process added for its own window.
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_DELETE, &data);
+    }
+}
+
+/// Let whichever process this one hands work to take the foreground (a second launch handing
+/// its path to the first instance). Allowed because this process was just started by the user.
+pub fn allow_any_foreground() {
+    use windows::Win32::UI::WindowsAndMessaging::{AllowSetForegroundWindow, ASFW_ANY};
+    // SAFETY: no pointers; failure only means the other window may flash instead.
+    let _ = unsafe { AllowSetForegroundWindow(ASFW_ANY) };
+}
+
+impl Chrome {
+    /// Restore the window if minimized and bring it to the front.
+    pub fn bring_to_front(self) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE,
+        };
+        // SAFETY: valid top-level window handle owned by this thread.
+        unsafe {
+            if IsIconic(self.hwnd()).as_bool() {
+                let _ = ShowWindow(self.hwnd(), SW_RESTORE);
+            }
+            let _ = SetForegroundWindow(self.hwnd());
+        }
+    }
+}
+
+/// Show the native "open file" dialog for one file type, modal to `owner`. **Blocks** until
+/// the user is done, so call it from a dedicated thread. `Ok(None)` means cancelled.
+pub fn pick_file(
+    owner: Option<isize>,
+    title: &str,
+    filter_name: &str,
+    filter: &str,
+) -> Result<Option<PathBuf>, String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+    use windows::Win32::UI::Shell::FOS_FILEMUSTEXIST;
+    // SAFETY: as in `pick_folder`; the filter strings outlive the dialog.
+    unsafe {
+        let initialized =
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE).is_ok();
+        let result = (|| -> windows::core::Result<Option<PathBuf>> {
+            let dialog: IFileOpenDialog =
+                CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
+            let options = dialog.GetOptions()?;
+            dialog.SetOptions(options | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST)?;
+            dialog.SetTitle(&HSTRING::from(title))?;
+            let (name, spec) = (HSTRING::from(filter_name), HSTRING::from(filter));
+            dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
+                pszName: PCWSTR(name.as_ptr()),
+                pszSpec: PCWSTR(spec.as_ptr()),
+            }])?;
+
+            let owner = owner.map(|raw| HWND(raw as *mut c_void));
+            if let Err(error) = dialog.Show(owner) {
+                return if error.code() == ERROR_CANCELLED.to_hresult() {
+                    Ok(None)
+                } else {
+                    Err(error)
+                };
+            }
+            let item = dialog.GetResult()?;
+            let path = item.GetDisplayName(SIGDN_FILESYSPATH)?;
+            let result = PathBuf::from(OsString::from_wide(path.as_wide()));
+            CoTaskMemFree(Some(path.0.cast::<c_void>().cast_const()));
+            Ok(Some(result))
+        })();
+        if initialized {
+            CoUninitialize();
+        }
+        result.map_err(|error| error.message())
+    }
 }

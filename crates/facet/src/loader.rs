@@ -6,12 +6,12 @@ use std::path::{Path, PathBuf};
 use eframe::egui;
 use facet_git::parse::FileDiff;
 use facet_git::{
-    diff_file, object_sizes, read_blob, CancellationToken, DiffRequest, DiffSource, Git, GitError,
-    LfsPointer, RepoInfo,
+    diff_file, object_sizes, read_blob, submodule_range, CancellationToken, DiffRequest,
+    DiffSource, Git, GitError, LfsPointer, RepoInfo,
 };
 
 use crate::filekind::{classify, extension, FileKind};
-use crate::workspace::{BinaryInfo, ImageDiff, ImageSide};
+use crate::workspace::{BinaryInfo, ImageDiff, ImageSide, SubmoduleDiff};
 
 /// Images are decoded only up to this file size…
 const MAX_IMAGE_BYTES: u64 = 256 * 1024 * 1024;
@@ -24,6 +24,7 @@ pub enum DiffPayload {
     Text(FileDiff),
     Binary(BinaryInfo),
     Image(ImageDiff),
+    Submodule(SubmoduleDiff),
 }
 
 /// Where one side of a comparison comes from.
@@ -35,7 +36,8 @@ pub enum Side {
     Worktree(PathBuf),
 }
 
-/// The old and new side for a diff request, given the entry's blobs.
+/// The old and new side for a diff request, given the entry's blobs. For a commit,
+/// `head_oid`/`index_oid` are the old and new blob of the file in that commit.
 pub fn sides(
     request: &DiffRequest,
     workdir: &Path,
@@ -49,8 +51,8 @@ pub fn sides(
             .split('/')
             .fold(workdir.to_owned(), |path, part| path.join(part)),
     );
-    match request.source {
-        DiffSource::Staged => (blob(head_oid), blob(index_oid)),
+    match &request.source {
+        DiffSource::Staged | DiffSource::Commit { .. } => (blob(head_oid), blob(index_oid)),
         DiffSource::Unstaged => (blob(index_oid), worktree),
         DiffSource::Conflict => (blob(head_oid), worktree),
         DiffSource::Untracked => (Side::Missing, worktree),
@@ -65,6 +67,8 @@ pub struct LoadContext {
     pub index_oid: Option<String>,
     pub ctx: egui::Context,
     pub cancel: CancellationToken,
+    /// The path is a submodule (gitlink): its "content" is a commit id.
+    pub submodule: bool,
 }
 
 /// Load whatever represents this change best. Known binary formats are never text-diffed.
@@ -76,6 +80,9 @@ pub async fn load(cx: &LoadContext) -> Result<DiffPayload, GitError> {
         cx.head_oid.as_deref(),
         cx.index_oid.as_deref(),
     );
+    if cx.submodule {
+        return Ok(DiffPayload::Submodule(submodule_diff(cx, &old, &new).await));
+    }
     match classify(&cx.request.path) {
         FileKind::Image => {
             let (old_image, new_image) = tokio::join!(image_side(cx, &old), image_side(cx, &new));
@@ -104,6 +111,72 @@ pub async fn load(cx: &LoadContext) -> Result<DiffPayload, GitError> {
             }
         }
     }
+}
+
+/// The commits between the submodule's old and new recorded commit, read in the
+/// submodule's own checkout (never fetched).
+async fn submodule_diff(cx: &LoadContext, old: &Side, new: &Side) -> SubmoduleDiff {
+    let checkout = cx
+        .request
+        .path
+        .split('/')
+        .fold(cx.info.root().to_owned(), |path, part| path.join(part));
+    let commit = |side: &Side| {
+        let checkout = checkout.clone();
+        let side = side.clone();
+        async move {
+            match side {
+                Side::Missing => None,
+                Side::Blob(oid) => Some(oid),
+                // The working copy side of a submodule is the commit checked out in it.
+                Side::Worktree(_) => {
+                    let output = cx
+                        .git
+                        .command(["rev-parse", "--verify", "-q", "HEAD"])
+                        .current_dir(&checkout)
+                        .background()
+                        .output()
+                        .await
+                        .ok()?;
+                    let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                    (output.success() && !text.is_empty()).then_some(text)
+                }
+            }
+        }
+    };
+    let (old, new) = tokio::join!(commit(old), commit(new));
+    let mut diff = SubmoduleDiff {
+        old,
+        new,
+        added: Vec::new(),
+        removed: Vec::new(),
+        unavailable: None,
+    };
+    let (Some(from), Some(to)) = (&diff.old, &diff.new) else {
+        return diff;
+    };
+    if !tokio::fs::try_exists(checkout.join(".git"))
+        .await
+        .unwrap_or(false)
+    {
+        diff.unavailable =
+            Some("The submodule is not checked out: update it to see these commits.".to_owned());
+        return diff;
+    }
+    match submodule_range(&cx.git, &checkout, from, to).await {
+        Ok((added, removed)) => {
+            diff.added = added;
+            diff.removed = removed;
+        }
+        Err(_) => {
+            diff.unavailable = Some(
+                "The submodule's checkout doesn't have these commits yet: update the \
+                 submodule (or fetch inside it) to see them."
+                    .to_owned(),
+            );
+        }
+    }
+    diff
 }
 
 /// The real bytes of one side, following a Git LFS pointer to its downloaded object when it

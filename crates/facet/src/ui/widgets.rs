@@ -5,8 +5,9 @@
 use std::sync::Arc;
 
 use eframe::egui::{
-    self, text::LayoutJob, Align2, Color32, CornerRadius, FontId, Galley, Id, Pos2, Rect, Response,
-    Sense, Stroke, StrokeKind, TextFormat, Ui, Vec2,
+    self, text::LayoutJob, Align2, Color32, CornerRadius, FontId, Frame, Galley, Id, Margin,
+    Painter, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind, TextEdit, TextFormat, Ui,
+    Vec2,
 };
 
 use crate::theme::{self, motion, radius, space, Palette};
@@ -365,6 +366,136 @@ pub fn shortcut_text(ui: &Ui, shortcut: &egui::KeyboardShortcut) -> String {
 /// "Label (Ctrl+X)" for tooltips.
 pub fn tooltip_with_shortcut(ui: &Ui, label: &str, shortcut: &egui::KeyboardShortcut) -> String {
     format!("{label}  ({})", shortcut_text(ui, shortcut))
+}
+
+/// Facet's mark: an accent tile with the facet diamond, as in the title bar and welcome view.
+pub fn app_mark(painter: &Painter, rect: Rect, palette: &Palette) {
+    let corner = (rect.width() * 0.28).round().clamp(2.0, 255.0) as u8;
+    painter.rect_filled(rect, CornerRadius::same(corner), palette.accent);
+    let center = rect.center();
+    let r = rect.width() * 0.3;
+    let stroke = Stroke::new((rect.width() / 11.0).max(1.2), palette.on_accent);
+    painter.add(Shape::closed_line(
+        vec![
+            center + Vec2::new(0.0, -r),
+            center + Vec2::new(r, 0.0),
+            center + Vec2::new(0.0, r),
+            center + Vec2::new(-r, 0.0),
+        ],
+        stroke,
+    ));
+    painter.line_segment(
+        [center - Vec2::new(r, 0.0), center + Vec2::new(r, 0.0)],
+        stroke,
+    );
+}
+
+/// The three tile hues repositories cycle through (accent, orange, green).
+fn monogram_color(palette: &Palette, name: &str) -> Color32 {
+    let orange = if palette.dark {
+        Color32::from_rgb(0xFF, 0xA6, 0x57)
+    } else {
+        Color32::from_rgb(0xB3, 0x59, 0x00)
+    };
+    let hues = [palette.accent, orange, palette.success];
+    let hash = name
+        .bytes()
+        .fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(b.into()));
+    hues[hash % hues.len()]
+}
+
+/// A rounded letter tile that tells repositories apart at a glance.
+pub fn monogram(painter: &Painter, rect: Rect, name: &str, palette: &Palette) {
+    let color = monogram_color(palette, name);
+    painter.rect_filled(
+        rect,
+        CornerRadius::same(radius::LAYER),
+        color.gamma_multiply(if palette.dark { 0.2 } else { 0.12 }),
+    );
+    let letter: String = name
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_uppercase().collect())
+        .unwrap_or_else(|| "·".to_owned());
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        letter,
+        FontId::new((rect.height() * 0.42).round(), theme::strong().family),
+        color,
+    );
+}
+
+/// A single-line text field: surface fill, hairline outline, accent outline while focused.
+pub fn text_field(ui: &mut Ui, rect: Rect, id: Id, text: &mut String, hint: &str) -> Response {
+    let palette = Palette::of(ui.ctx());
+    let focused = ui.ctx().memory(|memory| memory.has_focus(id));
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(radius::M),
+        palette.surface,
+        if focused {
+            Stroke::new(1.5, palette.accent)
+        } else {
+            palette.hairline_stroke()
+        },
+        StrokeKind::Inside,
+    );
+    ui.put(
+        rect,
+        TextEdit::singleline(text)
+            .id(id)
+            .hint_text(hint)
+            .font(theme::body())
+            .text_color(palette.text)
+            .frame(Frame::NONE.inner_margin(Margin::symmetric(10, 0)))
+            .desired_width(rect.width())
+            .align(Align2::LEFT_CENTER),
+    )
+}
+
+/// A hoverable row inside a flyout or list: rounded hover fill (or the selected tint), and
+/// the focus ring. Returns the click response.
+pub fn list_row(ui: &Ui, rect: Rect, id: Id, selected: bool) -> Response {
+    let palette = Palette::of(ui.ctx());
+    let response = ui.interact(rect, id, Sense::click());
+    let fill = if selected {
+        palette.accent_soft
+    } else {
+        interaction_fill(ui, &response, palette)
+    };
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(radius::M), fill);
+    focus_ring(ui, &response, rect, radius::M, palette);
+    response
+}
+
+/// A keyboard shortcut drawn as a small outlined key cap, right-aligned at `right_center`.
+/// Returns its width.
+pub fn key_cap(ui: &Ui, right_center: Pos2, text: &str) -> f32 {
+    let palette = Palette::of(ui.ctx());
+    let galley = ui.painter().layout_no_wrap(
+        text.to_owned(),
+        FontId::new(11.0, egui::FontFamily::Proportional),
+        palette.text_tertiary,
+    );
+    let size = galley.size() + Vec2::new(12.0, 4.0);
+    let rect = Rect::from_min_size(
+        Pos2::new(right_center.x - size.x, right_center.y - size.y / 2.0),
+        size,
+    );
+    ui.painter().rect_stroke(
+        rect,
+        CornerRadius::same(radius::S),
+        palette.hairline_stroke(),
+        StrokeKind::Inside,
+    );
+    ui.painter().galley(
+        rect.center() - galley.size() / 2.0,
+        galley,
+        palette.text_tertiary,
+    );
+    size.x
 }
 
 #[cfg(test)]

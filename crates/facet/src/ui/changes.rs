@@ -9,20 +9,21 @@ use eframe::egui::{
     TextFormat, Ui, UiBuilder, Vec2,
 };
 use facet_git::parse::{Change, EntryKind, StatusEntry};
-use facet_git::Head;
 
+use super::power::BANNER;
 use super::widgets::{
     self, button_enabled, checkbox, icon_button_at, skeleton, text_button_at, text_button_width,
     text_line, ButtonKind,
 };
 use super::{region, splitter_feedback, SPLITTER_GRAB};
 use crate::actions::{shortcut, Action};
-use crate::app::{FacetApp, TabState};
+use crate::app::FacetApp;
+use crate::app_trees::LfsState;
+use crate::history::View;
 use crate::settings::{Settings, CHANGES_WIDTH, COMMIT_BOX_HEIGHT};
 use crate::theme::{self, icon, radius, space, Palette};
 use crate::workspace::{Area, Row, Workspace};
 
-const HEADER_HEIGHT: f32 = 44.0;
 const FILE_ROW: f32 = 28.0;
 const MIN_DIFF_WIDTH: f32 = 320.0;
 const MIN_LIST_HEIGHT: f32 = 96.0;
@@ -32,11 +33,37 @@ impl FacetApp {
         let palette = Palette::of(ui.ctx());
         let mut actions = Vec::new();
 
-        let header = Rect::from_min_size(rect.min, Vec2::new(rect.width(), HEADER_HEIGHT));
-        self.repo_header(ui, header, &mut actions);
-        widgets::hairline_h(ui, rect.x_range().into(), header.bottom());
-
-        let body = Rect::from_min_max(Pos2::new(rect.left(), header.bottom() + 1.0), rect.max);
+        // Branch, sync and the Changes / History switch live in the title bar and sidebar.
+        let mut body = rect;
+        if self
+            .active_tab()
+            .is_some_and(|tab| tab.power.operation.is_some())
+        {
+            let banner = Rect::from_min_size(body.min, Vec2::new(body.width(), BANNER));
+            region(ui, "operation-banner", banner, |ui| {
+                self.operation_banner(ui, banner, &mut actions);
+            });
+            widgets::hairline_h(ui, rect.x_range().into(), banner.bottom());
+            body.min.y = banner.bottom() + 1.0;
+        }
+        if self
+            .active_tab()
+            .is_some_and(|tab| tab.power.blame.is_some())
+        {
+            region(ui, "blame", body, |ui| {
+                self.blame_view(ui, body, &mut actions)
+            });
+            self.pending.extend(actions);
+            return;
+        }
+        if self
+            .active_tab()
+            .is_some_and(|tab| tab.view == View::History)
+        {
+            self.history_view(ui, body, &mut actions);
+            self.pending.extend(actions);
+            return;
+        }
         let width = self
             .settings
             .changes_width
@@ -85,130 +112,6 @@ impl FacetApp {
         self.pending.extend(actions);
     }
 
-    /// Branch, tracking state and the commit at HEAD, plus refresh / explorer buttons.
-    fn repo_header(&self, ui: &mut Ui, rect: Rect, actions: &mut Vec<Action>) {
-        let palette = Palette::of(ui.ctx());
-        let Some(tab) = self.active_tab() else {
-            return;
-        };
-        let TabState::Ready { head, .. } = &tab.state else {
-            return;
-        };
-        let work = &tab.work;
-        let center = rect.center().y;
-
-        let size = 28.0;
-        let refresh = Rect::from_center_size(
-            Pos2::new(rect.right() - space::M - size / 2.0, center),
-            Vec2::splat(size),
-        );
-        let tooltip = widgets::tooltip_with_shortcut(ui, "Refresh", &shortcut::REFRESH);
-        if icon_button_at(
-            ui,
-            refresh,
-            Id::unique("work-refresh"),
-            icon::REFRESH,
-            &tooltip,
-        )
-        .clicked()
-        {
-            actions.push(Action::Refresh);
-        }
-        let reveal = refresh.translate(Vec2::new(-(size + space::XS), 0.0));
-        let tooltip =
-            widgets::tooltip_with_shortcut(ui, "Open in File Explorer", &shortcut::REVEAL);
-        if icon_button_at(
-            ui,
-            reveal,
-            Id::unique("work-reveal"),
-            icon::FOLDER,
-            &tooltip,
-        )
-        .clicked()
-        {
-            actions.push(Action::RevealInExplorer);
-        }
-        let mut right = reveal.left() - space::M;
-        if let Some(ms) = work.perf.last_ms {
-            let painted = ui.painter().text(
-                Pos2::new(right, center),
-                Align2::RIGHT_CENTER,
-                format!("Status {ms} ms"),
-                theme::small(),
-                palette.text_tertiary,
-            );
-            right = painted.left() - space::M;
-        }
-        let room = |x: f32| (right - x).max(0.0);
-
-        let mut x = rect.left() + space::M;
-        let (branch, color) = match head {
-            Head::Branch { name, .. } => (name.clone(), palette.text),
-            Head::Detached { commit } => {
-                (format!("Detached at {}", commit.short_oid), palette.warning)
-            }
-        };
-        x += text_line(
-            ui,
-            Pos2::new(x, center),
-            &branch,
-            theme::strong(),
-            color,
-            room(x),
-        ) + space::S;
-
-        let mut tracking = Vec::new();
-        if let Some(ahead) = work.branch.ahead.filter(|n| *n > 0) {
-            tracking.push(format!("↑{ahead}"));
-        }
-        if let Some(behind) = work.branch.behind.filter(|n| *n > 0) {
-            tracking.push(format!("↓{behind}"));
-        }
-        if !tracking.is_empty() {
-            x += text_line(
-                ui,
-                Pos2::new(x, center),
-                &tracking.join(" "),
-                theme::small_strong(),
-                palette.text_secondary,
-                room(x),
-            ) + space::S;
-        }
-        x += space::XS;
-        match head.commit() {
-            Some(commit) => {
-                x += text_line(
-                    ui,
-                    Pos2::new(x, center),
-                    &commit.short_oid,
-                    theme::mono(),
-                    palette.text_tertiary,
-                    room(x),
-                ) + space::S;
-                if room(x) > 24.0 {
-                    text_line(
-                        ui,
-                        Pos2::new(x, center),
-                        &commit.subject,
-                        theme::body(),
-                        palette.text_secondary,
-                        room(x),
-                    );
-                }
-            }
-            None => {
-                text_line(
-                    ui,
-                    Pos2::new(x, center),
-                    "No commits yet",
-                    theme::body(),
-                    palette.text_secondary,
-                    room(x),
-                );
-            }
-        }
-    }
-
     /// File list, the optional performance offer, and the commit box.
     fn changes_panel(&mut self, ui: &mut Ui, rect: Rect, actions: &mut Vec<Action>) {
         let can_commit = self.can_commit();
@@ -220,9 +123,12 @@ impl FacetApp {
             .commit_box_height
             .min((rect.height() - MIN_LIST_HEIGHT).max(*COMMIT_BOX_HEIGHT.start()))
             .round();
-        let Some(work) = self.active_work_mut() else {
+        let Some(index) = self.active.filter(|_| self.active_work().is_some()) else {
             return;
         };
+        let tab = &mut self.tabs[index];
+        let lfs = &tab.lfs;
+        let work = &mut tab.work;
 
         let offer = (work.perf_offer() && !declined)
             .then(|| offer_text(ui, rect.width() - space::M * 2.0, work.perf.last_ms));
@@ -240,7 +146,7 @@ impl FacetApp {
         let list = Rect::from_min_max(rect.min, Pos2::new(rect.right(), offer_rect.top()));
 
         if work.loaded {
-            file_list(ui, list, work, actions);
+            file_list(ui, list, work, lfs, actions);
         } else {
             list_skeleton(ui, list);
         }
@@ -274,7 +180,13 @@ impl FacetApp {
 }
 
 /// The combined, virtualized list: "Staged" header and files, "Changes" header and files.
-fn file_list(ui: &mut Ui, rect: Rect, work: &mut Workspace, actions: &mut Vec<Action>) {
+fn file_list(
+    ui: &mut Ui,
+    rect: Rect,
+    work: &mut Workspace,
+    lfs: &LfsState,
+    actions: &mut Vec<Action>,
+) {
     let palette = Palette::of(ui.ctx());
     if work.staged.is_empty() && work.unstaged.is_empty() {
         let center = rect.center();
@@ -327,7 +239,9 @@ fn file_list(ui: &mut Ui, rect: Rect, work: &mut Workspace, actions: &mut Vec<Ac
                         Row::Header(area) => {
                             section_header(ui, rect, area, work.list(area).len(), actions);
                         }
-                        Row::File(area, index) => file_row(ui, rect, work, area, index, actions),
+                        Row::File(area, index) => {
+                            file_row(ui, rect, work, lfs, area, index, actions);
+                        }
                     }
                 }
             });
@@ -436,10 +350,12 @@ fn split_path(path: &str) -> (&str, &str) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn file_row(
     ui: &Ui,
     rect: Rect,
     work: &Workspace,
+    lfs: &LfsState,
     area: Area,
     index: usize,
     actions: &mut Vec<Action>,
@@ -530,6 +446,53 @@ fn file_row(
         }
     }
 
+    // Git LFS: who holds the lock, and whether the file is stored with LFS.
+    let attributes = lfs.attributes(&entry.path);
+    let lock = lfs.lock(&entry.path);
+    let mut lfs_note = String::new();
+    let lock_mark = match lock {
+        Some(lock) if lock.ours == Some(true) => {
+            lfs_note.push_str("\nLocked by you");
+            Some(palette.accent)
+        }
+        Some(lock) => {
+            let owner = if lock.owner.is_empty() {
+                "someone else"
+            } else {
+                lock.owner.as_str()
+            };
+            lfs_note.push_str(&format!("\nLocked by {owner}"));
+            Some(palette.danger)
+        }
+        // Edited without a lock: the team expects one.
+        None if attributes.lockable && lfs.locks_loaded => {
+            lfs_note.push_str("\nLockable, but not locked by you: lock it before you edit it");
+            Some(palette.warning)
+        }
+        None => None,
+    };
+    if let Some(color) = lock_mark {
+        ui.painter().text(
+            Pos2::new(right - 8.0, center),
+            Align2::CENTER_CENTER,
+            icon::LOCK,
+            theme::icon_font(11.0),
+            color,
+        );
+        right -= 16.0 + space::XS;
+    }
+    if attributes.lfs {
+        lfs_note.push_str("\nStored with Git LFS");
+        let painted = ui.painter().text(
+            Pos2::new(right, center),
+            Align2::RIGHT_CENTER,
+            "LFS",
+            theme::small_strong(),
+            palette.text_tertiary,
+        );
+        right = painted.left() - space::XS;
+    }
+
     let (dir, name) = split_path(&entry.path);
     let text_left = inner.left() + space::S + 12.0 + space::S;
     let available = (right - space::XS - text_left).max(0.0);
@@ -576,11 +539,134 @@ fn file_row(
             }
         });
     }
+    // Right-clicking outside the selection selects that file first, like Explorer.
+    if response.secondary_clicked() && !selected {
+        actions.push(Action::SelectFile {
+            area,
+            index,
+            toggle: false,
+            extend: false,
+        });
+    }
     let mut tooltip = format!("{}\n{meaning}", entry.path);
     if entry.submodule {
         tooltip.push_str(" (submodule)");
     }
-    response.on_hover_text(tooltip);
+    tooltip.push_str(&lfs_note);
+    let response = response.on_hover_text(tooltip);
+    response.context_menu(|ui| {
+        let stage = match area {
+            Area::Unstaged => ("Stage", Action::StageSelected),
+            Area::Staged => ("Unstage", Action::UnstageSelected),
+        };
+        super::history::menu_item(ui, stage.0, stage.1, actions);
+        super::history::menu_item(ui, "Stash Selected Files…", Action::StashSelected, actions);
+        if entry.conflict.is_some() {
+            ui.separator();
+            let path = entry.path.clone();
+            super::history::menu_item(
+                ui,
+                "Resolve Conflicts…",
+                Action::ResolveConflicts(path.clone()),
+                actions,
+            );
+            super::history::menu_item(
+                ui,
+                "Take Ours (Current Branch)",
+                Action::TakeSide {
+                    path: path.clone(),
+                    side: facet_git::conflict::Side::Ours,
+                },
+                actions,
+            );
+            super::history::menu_item(
+                ui,
+                "Take Theirs (Incoming)",
+                Action::TakeSide {
+                    path: path.clone(),
+                    side: facet_git::conflict::Side::Theirs,
+                },
+                actions,
+            );
+            super::history::menu_item(
+                ui,
+                "Open in External Merge Tool",
+                Action::OpenMergeTool(path),
+                actions,
+            );
+        }
+        if lfs.usage.lfs && (attributes.lfs || attributes.lockable || lock.is_some()) {
+            ui.separator();
+            match lock {
+                None => super::history::menu_item(
+                    ui,
+                    "Lock File (LFS)",
+                    Action::LockFile(entry.path.clone()),
+                    actions,
+                ),
+                Some(lock) if lock.ours == Some(false) => super::history::menu_item(
+                    ui,
+                    "Force Unlock (LFS)…",
+                    Action::ForceUnlock {
+                        id: lock.id.clone(),
+                        path: lock.path.clone(),
+                        owner: lock.owner.clone(),
+                    },
+                    actions,
+                ),
+                Some(lock) => super::history::menu_item(
+                    ui,
+                    "Unlock File (LFS)",
+                    Action::UnlockFile {
+                        id: lock.id.clone(),
+                        path: lock.path.clone(),
+                    },
+                    actions,
+                ),
+            }
+        }
+        if entry.submodule {
+            ui.separator();
+            super::history::menu_item(
+                ui,
+                "Open Submodule in Tab",
+                Action::OpenSubmodule(entry.path.clone()),
+                actions,
+            );
+            super::history::menu_item(
+                ui,
+                "Update Submodule",
+                Action::UpdateSubmodules(Some(entry.path.clone())),
+                actions,
+            );
+        }
+        ui.separator();
+        if entry.kind != EntryKind::Untracked {
+            super::history::menu_item(
+                ui,
+                "File History",
+                Action::ShowFileHistory(entry.path.clone()),
+                actions,
+            );
+            super::history::menu_item(
+                ui,
+                "Blame",
+                Action::Blame {
+                    path: entry.path.clone(),
+                    rev: None,
+                },
+                actions,
+            );
+            super::history::menu_item(
+                ui,
+                "Open in External Diff Tool",
+                Action::OpenDiffTool,
+                actions,
+            );
+            ui.separator();
+        }
+        super::history::menu_item(ui, "Copy File Path", Action::CopyFilePath, actions);
+    });
 }
 
 fn list_skeleton(ui: &Ui, rect: Rect) {
