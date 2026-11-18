@@ -258,6 +258,11 @@ impl GitCommand {
             .stderr(Stdio::piped())
             // Credential prompts must go through a helper/GUI, never a hidden console.
             .env("GIT_TERMINAL_PROMPT", "0")
+            // Git for Windows localizes its messages from the Windows display language, and
+            // callers recognise some failures by their English stderr text. Paths and commit
+            // text are UTF-8 bytes either way, so Japanese content is unaffected.
+            .env("LC_ALL", "en_US.UTF-8")
+            .env("LANG", "en_US.UTF-8")
             .kill_on_drop(true);
         if !self.optional_locks {
             cmd.env("GIT_OPTIONAL_LOCKS", "0");

@@ -135,6 +135,8 @@ fn changed_ranges(text: &str, tokens: &[Range<usize>], common: &[bool]) -> Vec<R
 }
 
 /// Split into words (letters, digits, `_`), whitespace runs, and single other characters.
+/// Japanese (and Chinese) text has no spaces between words, so each kana or kanji is its
+/// own token: otherwise a whole sentence would be one word and never partly match.
 fn tokenize(text: &str) -> Vec<Range<usize>> {
     #[derive(PartialEq, Clone, Copy)]
     enum Class {
@@ -143,7 +145,9 @@ fn tokenize(text: &str) -> Vec<Range<usize>> {
         Other,
     }
     let class = |c: char| {
-        if c.is_alphanumeric() || c == '_' {
+        if is_cjk(c) {
+            Class::Other
+        } else if c.is_alphanumeric() || c == '_' {
             Class::Word
         } else if c.is_whitespace() {
             Class::Space
@@ -170,6 +174,18 @@ fn tokenize(text: &str) -> Vec<Range<usize>> {
     tokens
 }
 
+/// Kana, kanji and the CJK punctuation/full-width forms that sit between them.
+fn is_cjk(c: char) -> bool {
+    matches!(c,
+        '\u{3001}'..='\u{30FF}'     // CJK punctuation (not the ideographic space), kana
+        | '\u{3400}'..='\u{4DBF}'   // CJK extension A
+        | '\u{4E00}'..='\u{9FFF}'   // CJK unified ideographs
+        | '\u{F900}'..='\u{FAFF}'   // CJK compatibility ideographs
+        | '\u{FF00}'..='\u{FFEF}'   // full-width and half-width forms
+        | '\u{20000}'..='\u{3134F}' // CJK extensions B-H
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,6 +206,25 @@ mod tests {
             ["let", " ", "x_1", " ", "=", " ", "foo", "(", "a", ",", "  ", "b", ")", ";"]
         );
         assert!(tokenize("").is_empty());
+    }
+
+    #[test]
+    fn japanese_is_split_per_character() {
+        let text = "// 変更を保存 save";
+        let tokens: Vec<&str> = tokenize(text).into_iter().map(|r| &text[r]).collect();
+        assert_eq!(
+            tokens,
+            ["/", "/", " ", "変", "更", "を", "保", "存", " ", "save"]
+        );
+    }
+
+    #[test]
+    fn a_changed_japanese_word() {
+        let old = "// 変更を保存する";
+        let new = "// 変更を破棄する";
+        let (a, b) = intraline(old, new).unwrap();
+        assert_eq!(changed(old, &a), ["保存"]);
+        assert_eq!(changed(new, &b), ["破棄"]);
     }
 
     #[test]

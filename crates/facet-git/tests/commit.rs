@@ -61,6 +61,32 @@ async fn commit_then_amend() {
 }
 
 #[tokio::test]
+async fn japanese_paths_and_messages_round_trip() {
+    let repo = TestRepo::init().await;
+    repo.write("ドキュメント/説明.md", "日本語のテキスト\n");
+
+    let status = repo.status().await;
+    assert_eq!(status.entries.len(), 1);
+    assert_eq!(status.entries[0].path, "ドキュメント/説明.md");
+
+    repo.git_ok(&["add", "--all"]).await;
+    let message = "説明を追加\n\n本文：日本語の説明です。\n";
+    let outcome = commit(&repo.git, &repo.path, message, false).await.unwrap();
+    assert!(outcome.success, "{}", outcome.output);
+
+    let summary = commit_summary(&repo.git, &repo.path).await.unwrap();
+    assert_eq!(summary.subject, "説明を追加");
+    assert_eq!(
+        last_commit_message(&repo.git, &repo.path)
+            .await
+            .unwrap()
+            .unwrap(),
+        message.trim_end()
+    );
+    assert!(repo.status().await.entries.is_empty());
+}
+
+#[tokio::test]
 async fn nothing_staged_is_a_rejected_commit_not_an_error() {
     let repo = TestRepo::init().await;
     repo.commit_file("a.txt", "a\n", "base").await;

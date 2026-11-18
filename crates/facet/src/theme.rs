@@ -93,6 +93,15 @@ const FAMILY_SEMIBOLD: &str = "facet-semibold";
 const FAMILY_DISPLAY: &str = "facet-display";
 const FAMILY_ICONS: &str = "facet-icons";
 
+/// Font data key of the Japanese fallback face.
+const FONT_JAPANESE: &str = "japanese";
+/// Japanese UI faces in `%WINDIR%\Fonts`, best first: (file, face index in the collection).
+const JAPANESE_FONTS: [(&str, u32); 3] = [
+    ("YuGothM.ttc", 1),  // Yu Gothic UI Regular
+    ("meiryo.ttc", 2),   // Meiryo UI
+    ("msgothic.ttc", 1), // MS UI Gothic
+];
+
 /// Body text.
 pub fn body() -> FontId {
     FontId::new(14.0, FontFamily::Proportional)
@@ -392,6 +401,20 @@ pub fn font_definitions(code_font: CodeFont) -> FontDefinitions {
         }
     }
 
+    // Segoe UI and the code fonts have no kana or kanji. Windows' own fallback for Japanese UI
+    // text is Yu Gothic UI; Meiryo UI and MS UI Gothic cover older or stripped installs. One
+    // face backs every chain (bold text in Japanese renders at regular weight) because each
+    // file is ~10-14 MB that stays resident.
+    let mut cjk_chain = Vec::new();
+    for (file, index) in JAPANESE_FONTS {
+        if let Some(mut cjk) = load(file) {
+            cjk.index = index;
+            fonts.font_data.insert(FONT_JAPANESE.into(), Arc::new(cjk));
+            cjk_chain.push(FONT_JAPANESE.to_owned());
+            break;
+        }
+    }
+
     for file in ["SegoeIcons.ttf", "segmdl2.ttf"] {
         if let Some(icons) = load(file) {
             fonts.font_data.insert(file.into(), Arc::new(icons));
@@ -430,6 +453,8 @@ pub fn font_definitions(code_font: CodeFont) -> FontDefinitions {
         chain.extend(fallback.iter().cloned());
         chain
     };
+    let text_chain = with_fallbacks(text_chain, &cjk_chain);
+    let mono_chain = with_fallbacks(mono_chain, &cjk_chain);
 
     fonts.families.insert(
         FontFamily::Proportional,
@@ -477,6 +502,32 @@ mod tests {
         }
         // Ease-out front-loads the movement.
         assert!(motion::ease_out(0.5) > 0.5);
+    }
+
+    #[test]
+    fn japanese_text_has_glyphs_in_every_text_font() {
+        let fonts_dir = std::path::PathBuf::from(
+            std::env::var_os("WINDIR").unwrap_or_else(|| r"C:\Windows".into()),
+        )
+        .join("Fonts");
+        if !JAPANESE_FONTS
+            .iter()
+            .any(|(file, _)| fonts_dir.join(file).exists())
+        {
+            eprintln!("no Japanese font installed; skipping");
+            return;
+        }
+        let ctx = egui::Context::default();
+        ctx.set_fonts(font_definitions(CodeFont::default()));
+        ctx.run_ui(Default::default(), |_| {})
+            .textures_delta
+            .clear();
+        for font in [body(), strong(), small(), title(), heading(), mono()] {
+            assert!(
+                ctx.fonts_mut(|fonts| fonts.has_glyphs(&font, "日本語のコミット、ブランチ。")),
+                "{font:?}"
+            );
+        }
     }
 
     #[test]
