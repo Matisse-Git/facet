@@ -81,6 +81,35 @@ Diagnostic environment variables:
 | `FACET_BENCH_SCROLL=diff:<path>` | Same, but open the changes view, select that changed file and scroll its text diff (20 px rows); used for the 10 MB diff (`diff:Docs/Generated/Big.txt`). |
 | `FACET_BENCH_SEARCH` | `<message\|author\|file\|code\|regex>:<text>`: once the active tab's history has loaded, run that search in History (timings go to `FACET_PERF_LOG`); combined with `FACET_BENCH_SCROLL` the scroll benchmark then runs over the results. |
 
+## Install and update on the owner's PC
+
+The owner uses Facet installed from this folder. **Double-click `update.cmd`** (repo root) to
+install or update it: it runs `scripts/build-installer.ps1 -Install`, which builds the `dist`
+exe, builds `crates/facet-setup` with that exe embedded (`FACET_SETUP_PAYLOAD`), writes
+`target\installer\Facet-Setup-<version>.exe` and runs it. `-Quiet` runs the setup with no dialogs.
+
+`facet-setup` (per-user, no admin, no certificate — unlike the MSIX):
+
+* installs to `%LOCALAPPDATA%\Programs\Facet` (`facet.exe` + `uninstall.exe`, a copy of the
+  setup), a Start menu shortcut, and a Settings → Apps entry under
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Facet`;
+* updates in place, also while Facet is open: the running `facet.exe` is renamed to
+  `facet-<nanos>.old` (Windows allows renaming a running exe, not deleting it) and the new one
+  written; the open window keeps the old build until reopened (the single-instance pipe would
+  otherwise hand a new launch to it), and the next setup run deletes the `.old` files;
+* uninstall: `uninstall.exe --uninstall [--quiet]` refuses while Facet is open, removes the
+  shortcut, the registry entry and the folder (a detached `cmd` removes the folder after the
+  uninstaller exits); `%APPDATA%\Facet\settings.json` is kept.
+
+Builds are stamped with `FACET_BUILD_ID` = short commit hash (`-modified` if the tree is dirty),
+shown in the Settings footer (`Facet 0.1.0 (c323554)`) and in Settings → Apps, so the owner
+can tell which build is installed. Without the env var (everyday builds) nothing is shown, and
+`facet-setup` gets an empty payload and refuses to run.
+
+**Session rule:** after a session changes the app, its closing summary tells the owner to run
+`update.cmd` to get the change onto their PC. Bump `[workspace.package] version` when a
+milestone ships.
+
 ## What M0 delivered
 
 - Cargo workspace: `facet-git` (git plumbing library) + `facet` (the app).
@@ -505,6 +534,11 @@ crates/facet-bench/
   src/main.rs                 generate (linear bench repo), graph (branchy bench repo), measure,
                               history (reflog / search / file history / blame timings), package
   src/package.rs              MSIX layout, AppxManifest.xml, logos (shares icon_art.rs), makeappx
+crates/facet-setup/           per-user installer / updater / uninstaller ("Install and update")
+  build.rs                    embeds FACET_SETUP_PAYLOAD (or an empty payload), asInvoker
+                              manifest, icon + version (shares facet's res.rs and icon_art.rs)
+  src/main.rs                 install (rename-aside update), Start menu .lnk, HKCU Uninstall
+                              entry, uninstall
 crates/facet/
   build.rs                    embeds the app manifest (PerMonitorV2, long paths, UTF-8) and, on
                               MSVC, writes + links facet.res (icon group + VERSIONINFO)

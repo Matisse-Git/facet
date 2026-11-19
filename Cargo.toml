@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/facet-git", "crates/facet", "crates/facet-bench"]
+members = ["crates/facet-git", "crates/facet", "crates/facet-bench", "crates/facet-setup"]
 
 [workspace.package]
 version = "0.1.0"

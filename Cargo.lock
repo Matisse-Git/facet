@@ -700,6 +700,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "facet-setup"
+version = "0.1.0"
+dependencies = [
+ "embed-manifest",
+ "png",
+ "windows",
+]
+
+[[package]]
 name = "fancy-regex"
 version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -5,3 +5,7 @@
 
 # Golden fixtures are byte-exact captures of git output; never normalize them.
 *.bin binary
+
+# Windows scripts keep CRLF (cmd.exe misparses LF batch files).
+*.cmd text eol=crlf
+*.ps1 text eol=crlf

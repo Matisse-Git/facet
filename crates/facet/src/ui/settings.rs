@@ -141,7 +141,7 @@ impl FacetApp {
                             ui.add_space(space::L);
                             ui.vertical_centered(|ui| {
                                 ui.label(
-                                    RichText::new(format!("Facet {}", env!("CARGO_PKG_VERSION")))
+                                    RichText::new(version_label())
                                         .font(theme::small())
                                         .color(palette.text_tertiary),
                                 );
@@ -865,4 +865,15 @@ fn segmented<T: Copy + PartialEq>(
         x += width;
     }
     chosen
+}
+
+/// `Facet 0.1.0`, plus the commit an installer build was made from (`FACET_BUILD_ID`, set by
+/// `scripts/build-installer.ps1`), so the owner can tell which build is installed.
+fn version_label() -> String {
+    match option_env!("FACET_BUILD_ID") {
+        Some(build) if !build.is_empty() => {
+            format!("Facet {} ({build})", env!("CARGO_PKG_VERSION"))
+        }
+        _ => format!("Facet {}", env!("CARGO_PKG_VERSION")),
+    }
 }
