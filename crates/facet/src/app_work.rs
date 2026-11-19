@@ -33,7 +33,12 @@ pub struct StatusSnapshot {
     pub status: Status,
     /// The commit at `HEAD`, when it is not the one the tab already knows.
     pub summary: Option<CommitSummary>,
+    /// Lines added / removed per path (empty when there are too many files to count).
+    pub counts: std::collections::HashMap<String, (u32, u32)>,
 }
+
+/// Line counts are shown for up to this many changed files.
+const MAX_COUNTED_FILES: usize = 400;
 
 /// Results of background work for one repository tab.
 pub enum WorkEvent {
@@ -260,7 +265,25 @@ impl FacetApp {
                         }
                         _ => Ok(None),
                     };
-                    summary.map(|summary| StatusSnapshot { status, summary })
+                    let counts = if status.entries.len() <= MAX_COUNTED_FILES {
+                        let untracked: Vec<String> = status
+                            .entries
+                            .iter()
+                            .filter(|entry| entry.kind == facet_git::parse::EntryKind::Untracked)
+                            .map(|entry| entry.path.clone())
+                            .collect();
+                        let has_head = status.branch.oid.is_some();
+                        facet_git::line_counts(&git, &root, has_head, &untracked)
+                            .await
+                            .unwrap_or_default()
+                    } else {
+                        std::collections::HashMap::new()
+                    };
+                    summary.map(|summary| StatusSnapshot {
+                        status,
+                        summary,
+                        counts,
+                    })
                 }
                 Err(error) => Err(error),
             };
@@ -318,6 +341,7 @@ impl FacetApp {
                     0
                 };
                 tab.work.apply_status(snapshot.status);
+                tab.work.counts = snapshot.counts;
                 // A different current file always loads; the same one only when stale.
                 let stale = std::mem::take(&mut tab.work.diff_stale);
                 self.sync_diff(index, stale);
@@ -1217,6 +1241,7 @@ impl FacetApp {
                 }
             }
             Action::SetImageMode(mode) => self.settings.image_mode = mode,
+            Action::SetSplitDiff(split) => self.settings.split_diff = split,
             Action::EnablePerf => self.set_perf(true),
             Action::DisablePerf => self.set_perf(false),
             Action::DeclinePerfOffer => {

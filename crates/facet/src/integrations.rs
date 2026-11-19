@@ -340,6 +340,124 @@ fn quoted_exe(script: &str, name: &str) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+/// Open `folder` in the terminal chosen in settings. Console programs started from Facet get a
+/// console window of their own. `git_exe` is where Git Bash is looked for (next to git).
+pub fn open_terminal(
+    terminal: crate::settings::Terminal,
+    installed: &Installed,
+    folder: &Path,
+    git_exe: &Path,
+) -> std::io::Result<()> {
+    use crate::settings::Terminal;
+    match terminal {
+        Terminal::WindowsTerminal => match installed.terminal.as_deref() {
+            Some(exe) => launch(OpenTarget::Terminal, exe, folder),
+            None => Err(not_found("Windows Terminal")),
+        },
+        Terminal::PowerShell => {
+            let places = Places::from_env();
+            let exe = first_file(on_path(&places, "pwsh.exe"))
+                .unwrap_or_else(|| PathBuf::from("powershell.exe"));
+            std::process::Command::new(exe)
+                .arg("-NoExit")
+                .current_dir(folder)
+                .spawn()
+                .map(drop)
+        }
+        Terminal::CommandPrompt => std::process::Command::new("cmd.exe")
+            .arg("/K")
+            .current_dir(folder)
+            .spawn()
+            .map(drop),
+        Terminal::GitBash => {
+            let exe = git_bash(git_exe).ok_or_else(|| not_found("Git Bash"))?;
+            std::process::Command::new(exe)
+                .arg(format!("--cd={}", folder.display()))
+                .current_dir(folder)
+                .spawn()
+                .map(drop)
+        }
+    }
+}
+
+/// `git-bash.exe` of the Git for Windows that `git_exe` belongs to (`…\Git\cmd\git.exe` or
+/// `…\Git\mingw64\bin\git.exe`), else of the usual install.
+fn git_bash(git_exe: &Path) -> Option<PathBuf> {
+    let from_git = git_exe
+        .ancestors()
+        .skip(1)
+        .take(3)
+        .map(|dir| dir.join("git-bash.exe"));
+    let places = Places::from_env();
+    let installs = places
+        .program_files
+        .iter()
+        .map(|dir| dir.join(r"Git\git-bash.exe"))
+        .chain(
+            places
+                .local_app_data
+                .iter()
+                .map(|dir| dir.join(r"Programs\Git\git-bash.exe")),
+        )
+        .collect::<Vec<_>>();
+    // `git` on PATH: find the folder it is in.
+    let on_path_git = places
+        .path
+        .iter()
+        .map(|dir| dir.join("git.exe"))
+        .find(|path| is_file(path))
+        .into_iter()
+        .flat_map(|git| {
+            git.ancestors()
+                .skip(1)
+                .take(3)
+                .map(|dir| dir.join("git-bash.exe"))
+                .collect::<Vec<_>>()
+        });
+    first_file(from_git.chain(on_path_git).chain(installs))
+}
+
+/// Open the repository folder, or `file` in it, in the editor chosen in settings.
+pub fn open_in_editor(
+    editor: crate::settings::Editor,
+    installed: &Installed,
+    root: &Path,
+    file: Option<&Path>,
+) -> std::io::Result<()> {
+    use crate::settings::Editor;
+    let target = file.map_or_else(|| root.to_owned(), |file| root.join(file));
+    let (open_target, exe) = match editor {
+        Editor::VsCode => (OpenTarget::VsCode, installed.vscode.as_deref()),
+        Editor::Rider => (OpenTarget::Rider, installed.rider.as_deref()),
+        Editor::System => {
+            return if file.is_some() {
+                crate::platform::edit_file(&target)
+            } else {
+                crate::platform::reveal_in_explorer(root)
+            };
+        }
+    };
+    let exe = exe.ok_or_else(|| not_found(editor.label()))?;
+    if file.is_some() {
+        // Both editors take a file after the folder: the file opens in that project.
+        std::process::Command::new(exe)
+            .arg(root)
+            .arg(&target)
+            .current_dir(root)
+            .spawn()
+            .map(drop)
+    } else {
+        launch(open_target, exe, root)
+    }
+}
+
+fn not_found(name: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("{name} wasn't found on this PC"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

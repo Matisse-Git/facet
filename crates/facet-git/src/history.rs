@@ -32,12 +32,50 @@ pub async fn stream_log(
     page: usize,
     on_page: impl FnMut(Vec<LogCommit>) + Send,
 ) -> Result<usize, GitError> {
-    stream(git, root, LOG_ARGS, cancel, first_page, page, on_page).await
+    stream_log_in(git, root, Scope::All, cancel, first_page, page, on_page).await
+}
+
+/// Which commits the history shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Scope {
+    /// Every branch, remote-tracking branch and tag ([`LOG_ARGS`]).
+    #[default]
+    All,
+    /// Only what `HEAD` can reach: the checked-out branch.
+    Current,
+}
+
+/// [`LOG_ARGS`] for `scope`.
+pub fn log_args(scope: Scope) -> Vec<String> {
+    LOG_ARGS
+        .iter()
+        .map(|arg| match (*arg, scope) {
+            ("--all", Scope::Current) => "HEAD".to_owned(),
+            (arg, _) => arg.to_owned(),
+        })
+        .collect()
+}
+
+/// [`stream_log`] limited to `scope`.
+pub async fn stream_log_in(
+    git: &Git,
+    root: &Path,
+    scope: Scope,
+    cancel: &CancellationToken,
+    first_page: usize,
+    page: usize,
+    on_page: impl FnMut(Vec<LogCommit>) + Send,
+) -> Result<usize, GitError> {
+    let args = log_args(scope);
+    stream(git, root, &args, cancel, first_page, page, on_page).await
 }
 
 /// What a history search looks at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SearchKind {
+    /// The subject, the author's name or the start of the commit id (case-insensitive,
+    /// plain text): the filter field above the history.
+    Any,
     /// The commit message (`--grep`, case-insensitive, plain text).
     Message,
     /// The author's name or e-mail (`--author`, case-insensitive, plain text).
@@ -51,7 +89,8 @@ pub enum SearchKind {
 }
 
 impl SearchKind {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
+        Self::Any,
         Self::Message,
         Self::Author,
         Self::Path,
@@ -61,6 +100,7 @@ impl SearchKind {
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::Any => "Message, author or hash",
             Self::Message => "Message",
             Self::Author => "Author",
             Self::Path => "File",
@@ -71,6 +111,9 @@ impl SearchKind {
 
     pub fn help(self) -> &'static str {
         match self {
+            Self::Any => {
+                "Commits whose subject or author contains the text, or whose id starts with it"
+            }
             Self::Message => "Commits whose message contains the text",
             Self::Author => "Commits by an author whose name or e-mail contains the text",
             Self::Path => "Commits that changed a file whose path contains the text",
@@ -84,8 +127,15 @@ impl SearchKind {
 
 /// Arguments of a history search over the same commits as the history list.
 pub fn search_args(kind: SearchKind, text: &str) -> Vec<String> {
-    let mut args: Vec<String> = LOG_ARGS.iter().map(|arg| (*arg).to_owned()).collect();
+    search_args_in(Scope::All, kind, text)
+}
+
+/// [`search_args`] limited to `scope`. A [`SearchKind::Any`] search is the plain log,
+/// filtered as it streams.
+pub fn search_args_in(scope: Scope, kind: SearchKind, text: &str) -> Vec<String> {
+    let mut args = log_args(scope);
     match kind {
+        SearchKind::Any => {}
         SearchKind::Message => {
             args.extend([
                 "-i".into(),
@@ -123,13 +173,62 @@ pub async fn stream_search(
     page: usize,
     on_page: impl FnMut(Vec<LogCommit>) + Send,
 ) -> Result<usize, GitError> {
+    stream_search_in(
+        git,
+        root,
+        Scope::All,
+        kind,
+        text,
+        cancel,
+        first_page,
+        page,
+        on_page,
+    )
+    .await
+}
+
+/// [`stream_search`] limited to `scope`.
+#[allow(clippy::too_many_arguments)]
+pub async fn stream_search_in(
+    git: &Git,
+    root: &Path,
+    scope: Scope,
+    kind: SearchKind,
+    text: &str,
+    cancel: &CancellationToken,
+    first_page: usize,
+    page: usize,
+    mut on_page: impl FnMut(Vec<LogCommit>) + Send,
+) -> Result<usize, GitError> {
     if text.trim().is_empty() {
         return Err(GitError::Unsupported(
             "Type something to search for.".to_owned(),
         ));
     }
-    let args = search_args(kind, text);
-    stream(git, root, &args, cancel, first_page, page, on_page).await
+    let args = search_args_in(scope, kind, text);
+    if kind != SearchKind::Any {
+        return stream(git, root, &args, cancel, first_page, page, on_page).await;
+    }
+    let needle = text.trim().to_lowercase();
+    let mut found = 0usize;
+    stream(git, root, &args, cancel, first_page, page, |commits| {
+        let kept: Vec<LogCommit> = commits
+            .into_iter()
+            .filter(|commit| matches_any(commit, &needle))
+            .collect();
+        found += kept.len();
+        on_page(kept);
+    })
+    .await?;
+    Ok(found)
+}
+
+/// Whether a commit's subject or author contains `needle` (lowercase), or its id starts
+/// with it.
+fn matches_any(commit: &LogCommit, needle: &str) -> bool {
+    commit.subject.to_lowercase().contains(needle)
+        || commit.author.to_lowercase().contains(needle)
+        || commit.oid.to_string().starts_with(needle)
 }
 
 async fn stream<S: AsRef<std::ffi::OsStr>>(

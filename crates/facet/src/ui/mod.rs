@@ -12,15 +12,17 @@ mod content;
 mod diff;
 mod history;
 pub use diff::LINE_HEIGHT as DIFF_LINE;
-pub use history::COMMIT_ROW;
+pub use history::commit_row_height;
 mod image_diff;
 pub mod palette;
 mod power;
 pub mod prompt;
 mod settings;
+pub(crate) use settings::version_label;
 mod sidebar;
 mod stash;
 mod titlebar;
+mod vector;
 pub mod toast;
 pub mod widgets;
 
@@ -124,11 +126,16 @@ impl FacetApp {
         ui.painter().rect(
             surface,
             corner,
-            palette.surface,
+            if self.settings_view.is_some() {
+                palette.chrome
+            } else {
+                palette.surface
+            },
             palette.hairline_stroke(),
             StrokeKind::Inside,
         );
 
+        diff::set_split(self.settings.split_diff);
         self.title_bar(ui, title);
         if sidebar_width > 1.0 {
             // Slide the full-width sidebar in from the left while it animates.

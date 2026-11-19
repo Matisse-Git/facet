@@ -12,7 +12,7 @@ use super::power::modal_area;
 use super::widgets::{self, button, button_enabled, icon_button_at, text_field, ButtonKind};
 use crate::actions::Action;
 use crate::app::FacetApp;
-use crate::app_add::{AddRepoView, AddTab, INITIAL_BRANCH};
+use crate::app_add::{AddRepoView, AddTab};
 use crate::theme::{self, icon, radius, space, Palette};
 
 const WIDTH: f32 = 560.0;
@@ -438,11 +438,12 @@ fn new_fields(ui: &mut Ui, view: &mut AddRepoView, actions: &mut Vec<Action>) ->
     field_label(ui, "Location");
     let (_, entered) = folder_field(ui, "new-parent", &mut view.new_parent, "", actions);
     submit |= entered;
+    let branch = &view.initial_branch;
     let text = view.new_dest().map_or_else(
-        || format!("Creates a folder with an empty repository on branch {INITIAL_BRANCH}."),
+        || format!("Creates a folder with an empty repository on branch {branch}."),
         |dest| {
             format!(
-                "Creates {} with an empty repository on branch {INITIAL_BRANCH}.",
+                "Creates {} with an empty repository on branch {branch}.",
                 dest.display()
             )
         },

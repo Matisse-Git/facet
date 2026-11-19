@@ -512,12 +512,14 @@ impl FacetApp {
         let git = self.git.clone();
         let tx = self.events_tx.clone();
         let ctx = self.ctx.clone();
+        let scope = self.history_scope();
         let tab = &self.tabs[index];
         self.spawn_work(tab, false, async move {
             let started = Instant::now();
-            let result = facet_git::stream_search(
+            let result = facet_git::stream_search_in(
                 &git,
                 &root,
+                scope,
                 kind,
                 &text,
                 &cancel,
@@ -1321,6 +1323,20 @@ impl FacetApp {
             }
             Action::RunSearch => self.run_search(index),
             Action::ClearFilter => self.clear_filter(index),
+            Action::SetHistoryAllBranches(all) => {
+                if self.settings.history_all_branches != all {
+                    self.settings.history_all_branches = all;
+                    let searching = matches!(
+                        self.tabs[index].history.filter.as_ref().map(|filter| &filter.kind),
+                        Some(FilterKind::Search { .. })
+                    );
+                    if searching {
+                        self.run_search(index);
+                    } else if self.tabs[index].history.filter.is_none() {
+                        self.load_history(index);
+                    }
+                }
+            }
             Action::ShowFileHistory(path) => {
                 self.show_filter(index, FilterKind::File { path });
             }

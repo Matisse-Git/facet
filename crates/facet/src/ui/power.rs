@@ -23,8 +23,6 @@ use crate::history::{FilterKind, History};
 use crate::power::{BlameView, ConflictEditor, RebaseEditor, SearchBar};
 use crate::theme::{self, icon, motion, radius, space, Palette};
 
-/// Height of the search / filter bar above the commit list.
-pub const FILTER_BAR: f32 = 40.0;
 /// Height of the banner shown while an operation is in progress.
 pub const BANNER: f32 = 40.0;
 const BLAME_HEADER: f32 = 44.0;
@@ -144,6 +142,7 @@ pub fn filter_bar(
     );
     let id = Id::unique("commit-search-field");
     let hint = match search.kind {
+        SearchKind::Any => "Message, author or hash — Enter to search",
         SearchKind::Message => "Words in the commit message — Enter to search",
         SearchKind::Author => "Name or e-mail — Enter to search",
         SearchKind::Path => "Part of a file path — Enter to search",

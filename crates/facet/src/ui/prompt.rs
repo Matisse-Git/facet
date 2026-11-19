@@ -37,6 +37,8 @@ pub enum PromptKind {
     AddWorktree,
     /// Fields: pattern. Checkbox: lockable.
     LfsTrack,
+    /// Fields: name, email.
+    CommitAuthor,
 }
 
 #[derive(Debug, Clone, PartialEq)]

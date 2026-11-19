@@ -79,8 +79,33 @@ pub async fn fetch(net: &Network<'_>, remote: Option<&str>) -> Result<(), GitErr
     }
 }
 
+/// Fetch every remote without asking anyone anything (the background fetch): no credential
+/// window, no askpass prompt; a remote that needs a sign-in just fails. Only refs change,
+/// never the working tree.
+pub async fn fetch_in_background(git: &Git, root: &Path) -> Result<(), GitError> {
+    git.with_env("GCM_INTERACTIVE", "never")
+        .with_env("GIT_TERMINAL_PROMPT", "0")
+        .with_env("GIT_ASKPASS", "echo")
+        .with_env("SSH_ASKPASS", "echo")
+        .with_env("SSH_ASKPASS_REQUIRE", "never")
+        .command([
+            "-c",
+            "credential.interactive=false",
+            "fetch",
+            "--all",
+            "--quiet",
+        ])
+        .current_dir(root)
+        .background()
+        .run()
+        .await
+        .map(drop)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PullMode {
+    /// Merge the upstream in (a merge commit when the histories have diverged).
+    Merge,
     /// Only fast-forward; never creates a merge commit.
     FastForwardOnly,
     /// Rebase local commits onto the upstream.
@@ -90,6 +115,7 @@ pub enum PullMode {
 /// Pull the current branch from its upstream.
 pub async fn pull(net: &Network<'_>, mode: PullMode) -> Result<(), GitError> {
     let flag = match mode {
+        PullMode::Merge => "--no-rebase",
         PullMode::FastForwardOnly => "--ff-only",
         PullMode::Rebase => "--rebase",
     };

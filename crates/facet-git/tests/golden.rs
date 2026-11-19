@@ -92,6 +92,7 @@ fn refs_listing() {
                 upstream: Some("origin/main".into()),
                 track: Track::Ahead,
                 date: 1_700_000_300,
+                author: String::new(),
             },
             GitRef {
                 full_name: "refs/heads/topic".into(),
@@ -103,6 +104,7 @@ fn refs_listing() {
                 upstream: None,
                 track: Track::None,
                 date: 1_700_000_120,
+                author: String::new(),
             },
             GitRef {
                 full_name: "refs/remotes/origin/main".into(),
@@ -116,6 +118,7 @@ fn refs_listing() {
                 upstream: None,
                 track: Track::None,
                 date: 1_700_000_240,
+                author: String::new(),
             },
             // refs/stash is skipped: stashes have their own list.
             GitRef {
@@ -128,6 +131,7 @@ fn refs_listing() {
                 upstream: None,
                 track: Track::None,
                 date: 1_700_000_240,
+                author: String::new(),
             },
             GitRef {
                 full_name: "refs/tags/v1.0".into(),
@@ -139,6 +143,7 @@ fn refs_listing() {
                 upstream: None,
                 track: Track::None,
                 date: 1_700_000_360,
+                author: String::new(),
             },
         ]
     );

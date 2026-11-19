@@ -58,7 +58,7 @@ impl Default for SearchBar {
     fn default() -> Self {
         Self {
             open: false,
-            kind: SearchKind::Message,
+            kind: SearchKind::Any,
             text: String::new(),
             focus: false,
         }

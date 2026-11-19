@@ -269,6 +269,73 @@ pub fn text_button_width(ui: &Ui, label: &str) -> f32 {
         + space::S * 2.0
 }
 
+/// The state a [`check_box_at`] shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Check {
+    On,
+    Off,
+    /// Some but not all (a partly staged file, some files of a list).
+    Mixed,
+}
+
+/// A check mark (the design's `m5 12 5 5 9-10` path) filling `rect`.
+pub fn check_mark(ui: &Ui, rect: Rect, color: Color32, width: f32) {
+    let to = |x: f32, y: f32| rect.min + Vec2::new(x, y) * (rect.width() / 24.0);
+    ui.painter().add(egui::Shape::line(
+        vec![to(5.0, 12.0), to(10.0, 17.0), to(19.0, 7.0)],
+        Stroke::new(width, color),
+    ));
+}
+
+/// A bare checkbox filling `rect` (16 or 18 pt): accent with a check or a dash when on or
+/// mixed, an outline when off. `clicked()` means "toggle".
+pub fn check_box_at(ui: &Ui, rect: Rect, id: Id, state: Check, tooltip: &str) -> Response {
+    let palette = Palette::of(ui.ctx());
+    let response = ui.interact(rect.expand(3.0), id, Sense::click());
+    let corner = CornerRadius::same(radius::S);
+    let size = rect.width();
+    let to = |x: f32, y: f32| rect.min + Vec2::new(x, y) * (size / 24.0);
+    match state {
+        Check::On | Check::Mixed => {
+            let fill = if response.hovered() {
+                mix(palette.accent, palette.text, 0.1)
+            } else {
+                palette.accent
+            };
+            ui.painter().rect_filled(rect, corner, fill);
+            let stroke = Stroke::new(size / 24.0 * 3.2, palette.on_accent);
+            if state == Check::On {
+                ui.painter().add(egui::Shape::line(
+                    vec![to(6.0, 12.5), to(10.5, 17.0), to(18.5, 7.5)],
+                    stroke,
+                ));
+            } else {
+                ui.painter().line_segment([to(6.5, 12.0), to(17.5, 12.0)], stroke);
+            }
+        }
+        Check::Off => {
+            let color = if response.hovered() {
+                palette.text_secondary
+            } else {
+                palette.text_tertiary
+            };
+            ui.painter().rect(
+                rect,
+                corner,
+                interaction_fill(ui, &response, palette),
+                Stroke::new(1.5, color),
+                StrokeKind::Inside,
+            );
+        }
+    }
+    focus_ring(ui, &response, rect.expand(1.0), radius::S + 1, palette);
+    if tooltip.is_empty() {
+        response
+    } else {
+        response.on_hover_text(tooltip)
+    }
+}
+
 /// A checkbox with a label. Returns the response; `clicked()` means "toggle".
 pub fn checkbox(ui: &mut Ui, checked: bool, label: &str, tooltip: &str, enabled: bool) -> Response {
     let palette = Palette::of(ui.ctx());
@@ -390,14 +457,9 @@ pub fn app_mark(painter: &Painter, rect: Rect, palette: &Palette) {
     );
 }
 
-/// The three tile hues repositories cycle through (accent, orange, green).
-fn monogram_color(palette: &Palette, name: &str) -> Color32 {
-    let orange = if palette.dark {
-        Color32::from_rgb(0xFF, 0xA6, 0x57)
-    } else {
-        Color32::from_rgb(0xB3, 0x59, 0x00)
-    };
-    let hues = [palette.accent, orange, palette.success];
+/// The three tile hues repositories and people cycle through (accent, orange, green).
+pub fn monogram_color(palette: &Palette, name: &str) -> Color32 {
+    let hues = [palette.accent, palette.orange, palette.success];
     let hash = name
         .bytes()
         .fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(b.into()));
@@ -424,6 +486,300 @@ pub fn monogram(painter: &Painter, rect: Rect, name: &str, palette: &Palette) {
         FontId::new((rect.height() * 0.42).round(), theme::strong().family),
         color,
     );
+}
+
+/// A round letter avatar for a person, tinted by their name.
+pub fn avatar(painter: &Painter, center: Pos2, diameter: f32, name: &str, palette: &Palette) {
+    let color = monogram_color(palette, name);
+    painter.circle_filled(center, diameter / 2.0, palette.soft(color));
+    let letter: String = name
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_uppercase().collect())
+        .unwrap_or_else(|| "·".to_owned());
+    painter.text(
+        center,
+        Align2::CENTER_CENTER,
+        letter,
+        FontId::new((diameter * 0.46).round(), theme::strong().family),
+        color,
+    );
+}
+
+/// The colors of a file status letter (`M`, `A`, `D`, `R`, `U`…): (letter color).
+pub fn status_color(status: char, palette: &Palette) -> Color32 {
+    match status {
+        'A' | 'U' | '?' => palette.success,
+        'D' => palette.danger,
+        'R' | 'C' => palette.accent,
+        '!' => palette.warning,
+        _ => palette.warning,
+    }
+}
+
+/// A file's status as a small tinted square with its letter, centered at `center`.
+pub fn status_badge(painter: &Painter, center: Pos2, status: char, palette: &Palette) {
+    let color = status_color(status, palette);
+    let rect = Rect::from_center_size(center, Vec2::splat(18.0));
+    painter.rect_filled(rect, CornerRadius::same(radius::S), palette.soft(color));
+    painter.text(
+        center,
+        Align2::CENTER_CENTER,
+        status,
+        FontId::new(10.5, theme::strong().family),
+        color,
+    );
+}
+
+/// Five blocks showing how big a change is and how much of it adds or removes lines, with
+/// its right edge at `right_center`. Returns its width.
+pub fn change_bar(
+    painter: &Painter,
+    right_center: Pos2,
+    added: usize,
+    removed: usize,
+    palette: &Palette,
+) -> f32 {
+    const BLOCKS: usize = 5;
+    let total = added + removed;
+    let colored = match total {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        3..=4 => 3,
+        5..=19 => 4,
+        _ => 5,
+    };
+    let mut green = (colored * added).checked_div(total).unwrap_or(0);
+    if added > 0 {
+        green = green.max(1);
+    }
+    let red = if removed > 0 {
+        (colored - green.min(colored)).max(1)
+    } else {
+        0
+    };
+    let green = green.min(colored - red.min(colored));
+    let width = BLOCKS as f32 * 6.0 + (BLOCKS - 1) as f32 * 2.0;
+    let left = right_center.x - width;
+    for block in 0..BLOCKS {
+        let color = if block < green {
+            palette.success
+        } else if block < green + red {
+            palette.danger
+        } else {
+            palette.hairline
+        };
+        let rect = Rect::from_min_size(
+            Pos2::new(left + block as f32 * 8.0, right_center.y - 5.0),
+            Vec2::new(6.0, 10.0),
+        );
+        painter.rect_filled(rect, CornerRadius::same(1), color);
+    }
+    width
+}
+
+/// Width [`outline_button_at`] needs.
+pub fn outline_button_width(ui: &Ui, glyph: Option<char>, label: &str) -> f32 {
+    let text = if label.is_empty() {
+        0.0
+    } else {
+        ui.painter()
+            .layout_no_wrap(label.to_owned(), theme::body(), Color32::WHITE)
+            .size()
+            .x
+    };
+    match (glyph.is_some(), label.is_empty()) {
+        (true, true) => 32.0,
+        (true, false) => 12.0 + 14.0 + space::S + text + 12.0,
+        _ => 14.0 + text + 14.0,
+    }
+}
+
+/// The design's secondary button: surface fill, hairline outline, 8 px corners, an optional
+/// icon. `label` may be empty for a square icon button.
+pub fn outline_button_at(
+    ui: &Ui,
+    rect: Rect,
+    id: Id,
+    glyph: Option<char>,
+    label: &str,
+    tooltip: &str,
+) -> Response {
+    let palette = Palette::of(ui.ctx());
+    let response = ui.interact(rect, id, Sense::click());
+    let corner = CornerRadius::same(radius::LAYER);
+    ui.painter().rect(
+        rect,
+        corner,
+        palette.surface,
+        palette.hairline_stroke(),
+        StrokeKind::Inside,
+    );
+    let fill = interaction_fill(ui, &response, palette);
+    ui.painter().rect_filled(rect.shrink(1.0), corner, fill);
+    let center = rect.center().y;
+    match (glyph, label.is_empty()) {
+        (Some(glyph), true) => {
+            ui.painter().text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                glyph,
+                theme::icon_font(14.0),
+                palette.text,
+            );
+        }
+        (glyph, _) => {
+            let mut x = rect.left() + if glyph.is_some() { 12.0 } else { 14.0 };
+            if let Some(glyph) = glyph {
+                ui.painter().text(
+                    Pos2::new(x + 7.0, center),
+                    Align2::CENTER_CENTER,
+                    glyph,
+                    theme::icon_font(14.0),
+                    palette.text,
+                );
+                x += 14.0 + space::S;
+            }
+            ui.painter().text(
+                Pos2::new(x, center),
+                Align2::LEFT_CENTER,
+                label,
+                theme::body(),
+                palette.text,
+            );
+        }
+    }
+    focus_ring(ui, &response, rect, radius::LAYER, palette);
+    if tooltip.is_empty() {
+        response
+    } else {
+        response.on_hover_text(tooltip)
+    }
+}
+
+/// The design's accent button at a fixed rectangle: accent fill, an optional icon and a
+/// semibold label, centered.
+pub fn primary_button_at(
+    ui: &Ui,
+    rect: Rect,
+    id: Id,
+    glyph: Option<char>,
+    label: &str,
+    enabled: bool,
+) -> Response {
+    let palette = Palette::of(ui.ctx());
+    let response = ui.interact(
+        rect,
+        id,
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    let corner = CornerRadius::same(radius::LAYER);
+    let fill = if !enabled {
+        palette.hairline
+    } else if response.is_pointer_button_down_on() {
+        mix(palette.accent, Color32::BLACK, 0.12)
+    } else {
+        let hover = ui.ctx().animate_bool_with_time_and_easing(
+            response.id.with("hover"),
+            response.hovered(),
+            motion::FAST,
+            motion::ease_out,
+        );
+        mix(palette.accent, mix(palette.accent, Color32::WHITE, 0.12), hover)
+    };
+    ui.painter().rect_filled(rect, corner, fill);
+    let color = if enabled {
+        palette.on_accent
+    } else {
+        palette.text_tertiary
+    };
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), theme::strong(), color);
+    let icon_width = if glyph.is_some() { 14.0 + space::S } else { 0.0 };
+    let left = rect.center().x - (icon_width + galley.size().x) / 2.0;
+    if let Some(glyph) = glyph {
+        ui.painter().text(
+            Pos2::new(left + 7.0, rect.center().y),
+            Align2::CENTER_CENTER,
+            glyph,
+            theme::icon_font(13.0),
+            color,
+        );
+    }
+    ui.painter().galley(
+        Pos2::new(left + icon_width, rect.center().y - galley.size().y / 2.0),
+        galley,
+        color,
+    );
+    focus_ring(ui, &response, rect.expand(1.0), radius::LAYER + 1, palette);
+    response
+}
+
+/// The design's search box: quiet fill, hairline outline (accent while focused), a
+/// magnifier, and the text. Returns the text edit's response.
+pub fn search_field(
+    ui: &mut Ui,
+    rect: Rect,
+    id: Id,
+    text: &mut String,
+    hint: &str,
+    right_inset: f32,
+) -> Response {
+    let palette = Palette::of(ui.ctx());
+    let focused = ui.ctx().memory(|memory| memory.has_focus(id));
+    let corner = CornerRadius::same(radius::LAYER);
+    ui.painter().rect(
+        rect,
+        corner,
+        palette.surface_alt,
+        palette.hairline_stroke(),
+        StrokeKind::Inside,
+    );
+    if focused {
+        // Windows text boxes: an accent underline while typing.
+        let line = Rect::from_min_max(
+            Pos2::new(rect.left() + 1.0, rect.bottom() - 2.0),
+            Pos2::new(rect.right() - 1.0, rect.bottom()),
+        );
+        ui.painter().rect_filled(
+            line,
+            CornerRadius {
+                nw: 0,
+                ne: 0,
+                sw: radius::LAYER,
+                se: radius::LAYER,
+            },
+            palette.accent,
+        );
+    }
+    ui.painter().text(
+        Pos2::new(rect.left() + 18.0, rect.center().y),
+        Align2::CENTER_CENTER,
+        theme::icon::SEARCH,
+        theme::icon_font(13.0),
+        palette.text_tertiary,
+    );
+    let field = Rect::from_min_max(
+        Pos2::new(rect.left() + 30.0, rect.top()),
+        Pos2::new(rect.right() - right_inset, rect.bottom()),
+    );
+    ui.put(
+        field,
+        TextEdit::singleline(text)
+            .id(id)
+            .hint_text(hint)
+            .font(theme::body())
+            .text_color(palette.text)
+            .frame(Frame::NONE.inner_margin(Margin::symmetric(2, 0)))
+            .desired_width(field.width())
+            .align(Align2::LEFT_CENTER),
+    )
 }
 
 /// A single-line text field: surface fill, hairline outline, accent outline while focused.

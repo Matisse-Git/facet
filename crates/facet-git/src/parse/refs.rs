@@ -9,8 +9,9 @@ use crate::GitError;
 /// ref is one line of NUL-separated fields.
 pub const REFS_FORMAT: &str = "--format=%(refname)%00%(objectname)%00%(*objectname)%00%(HEAD)\
                                %00%(upstream)%00%(upstream:trackshort)%00%(symref)\
-                               %00%(creatordate:unix)";
-const FIELDS: usize = 8;
+                               %00%(creatordate:unix)%00%(authorname)";
+/// Fields of a line; output of the older format without `%(authorname)` is read too.
+const FIELDS: usize = 9;
 const COMMAND: &str = "for-each-ref";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +54,8 @@ pub struct GitRef {
     pub track: Track,
     /// Creation date (tagger date for annotated tags, committer date otherwise).
     pub date: i64,
+    /// Who wrote the commit it points at (empty for annotated tags).
+    pub author: String,
 }
 
 impl GitRef {
@@ -77,7 +80,7 @@ pub fn parse_refs(data: &[u8], remotes: &[String]) -> Result<Vec<GitRef>, GitErr
     let mut refs = Vec::new();
     for line in text.split('\n').filter(|line| !line.is_empty()) {
         let fields: Vec<&str> = line.split('\0').collect();
-        if fields.len() != FIELDS {
+        if fields.len() != FIELDS && fields.len() != FIELDS - 1 {
             return Err(GitError::parse(
                 COMMAND,
                 format!("expected {FIELDS} fields, got {}: {line:?}", fields.len()),
@@ -136,6 +139,9 @@ pub fn parse_refs(data: &[u8], remotes: &[String]) -> Result<Vec<GitRef>, GitErr
                 _ => Track::None,
             },
             date: date.trim().parse().unwrap_or(0),
+            author: fields
+                .get(8)
+                .map_or_else(String::new, |author| author.trim().to_owned()),
         });
     }
     Ok(refs)

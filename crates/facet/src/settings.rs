@@ -19,10 +19,10 @@ const MAX_RECENT: usize = 12;
 pub const SIDEBAR_WIDTH: std::ops::RangeInclusive<f32> = 176.0..=480.0;
 pub const COMMAND_LOG_HEIGHT: std::ops::RangeInclusive<f32> = 96.0..=640.0;
 pub const CHANGES_WIDTH: std::ops::RangeInclusive<f32> = 240.0..=720.0;
-pub const COMMIT_BOX_HEIGHT: std::ops::RangeInclusive<f32> = 104.0..=480.0;
+pub const COMMIT_BOX_HEIGHT: std::ops::RangeInclusive<f32> = 178.0..=480.0;
 pub const DETAIL_WIDTH: std::ops::RangeInclusive<f32> = 320.0..=1200.0;
 /// Sidebar sections that can be collapsed (by their title).
-pub const SIDEBAR_SECTIONS: [&str; 8] = [
+pub const SIDEBAR_SECTIONS: [&str; 7] = [
     "Branches",
     "Remotes",
     "Tags",
@@ -30,7 +30,6 @@ pub const SIDEBAR_SECTIONS: [&str; 8] = [
     "Worktrees",
     "Submodules",
     "Locks",
-    "Recent",
 ];
 /// Interface sizes offered in settings (egui zoom factors). Ctrl+= / Ctrl+- / Ctrl+0 step
 /// through the same range.
@@ -72,6 +71,8 @@ impl CodeFont {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PullMode {
+    /// Merge the upstream in (a merge commit when the histories have diverged).
+    Merge,
     /// Fast-forward only; never creates a merge commit.
     #[default]
     FastForwardOnly,
@@ -80,10 +81,11 @@ pub enum PullMode {
 }
 
 impl PullMode {
-    pub const ALL: [Self; 2] = [Self::FastForwardOnly, Self::Rebase];
+    pub const ALL: [Self; 3] = [Self::Merge, Self::Rebase, Self::FastForwardOnly];
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::Merge => "Merge",
             Self::FastForwardOnly => "Fast-Forward Only",
             Self::Rebase => "Rebase",
         }
@@ -91,9 +93,98 @@ impl PullMode {
 
     pub fn git(self) -> facet_git::PullMode {
         match self {
+            Self::Merge => facet_git::PullMode::Merge,
             Self::FastForwardOnly => facet_git::PullMode::FastForwardOnly,
             Self::Rebase => facet_git::PullMode::Rebase,
         }
+    }
+}
+
+/// How much room rows get.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Density {
+    #[default]
+    Comfortable,
+    /// Shorter rows: more files and commits on screen.
+    Compact,
+}
+
+impl Density {
+    pub const ALL: [Self; 2] = [Self::Comfortable, Self::Compact];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Comfortable => "Comfortable",
+            Self::Compact => "Compact",
+        }
+    }
+}
+
+/// The editor files and unresolved conflicts open in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Editor {
+    #[default]
+    VsCode,
+    Rider,
+    /// Whatever Windows opens the file type with.
+    System,
+}
+
+impl Editor {
+    pub const ALL: [Self; 3] = [Self::VsCode, Self::Rider, Self::System];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::VsCode => "Visual Studio Code",
+            Self::Rider => "JetBrains Rider",
+            Self::System => "Windows default app",
+        }
+    }
+}
+
+/// The terminal the repository folder opens in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[allow(clippy::enum_variant_names)] // "Windows Terminal" is the product's name.
+pub enum Terminal {
+    #[default]
+    WindowsTerminal,
+    PowerShell,
+    CommandPrompt,
+    GitBash,
+}
+
+impl Terminal {
+    pub const ALL: [Self; 4] = [
+        Self::WindowsTerminal,
+        Self::PowerShell,
+        Self::CommandPrompt,
+        Self::GitBash,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::WindowsTerminal => "Windows Terminal",
+            Self::PowerShell => "PowerShell",
+            Self::CommandPrompt => "Command Prompt",
+            Self::GitBash => "Git Bash",
+        }
+    }
+}
+
+/// Code font sizes offered in settings.
+pub const CODE_FONT_SIZES: [f32; 6] = [11.0, 12.0, 13.0, 14.0, 15.0, 16.0];
+/// Background fetch intervals offered in settings, in minutes.
+pub const FETCH_INTERVALS: [u32; 5] = [1, 5, 10, 15, 30];
+
+/// `Every minute`, `Every 5 minutes`.
+pub fn fetch_interval_label(minutes: u32) -> String {
+    if minutes == 1 {
+        "Every minute".to_owned()
+    } else {
+        format!("Every {minutes} minutes")
     }
 }
 
@@ -157,6 +248,8 @@ pub struct Settings {
     /// Width of the commit detail pane beside the history list.
     pub detail_width: f32,
     pub pull_mode: PullMode,
+    /// The history lists every branch (not only the checked-out one).
+    pub history_all_branches: bool,
     /// Collapsed sidebar sections (titles from [`SIDEBAR_SECTIONS`]).
     pub collapsed_sections: Vec<String>,
     /// Repositories where the offer to enable `core.fsmonitor` / `core.untrackedCache` was
@@ -175,6 +268,20 @@ pub struct Settings {
     /// Interface size (egui zoom factor; 1.0 is the design size).
     pub ui_scale: f32,
     pub code_font: CodeFont,
+    /// Point size of the code font.
+    pub code_font_size: f32,
+    /// Use the accent color picked in Windows instead of Facet's blue.
+    pub windows_accent: bool,
+    pub density: Density,
+    /// Fetch every open repository's remotes every `fetch_minutes`.
+    pub auto_fetch: bool,
+    /// Text diffs side by side (old left, new right) instead of unified.
+    pub split_diff: bool,
+    pub fetch_minutes: u32,
+    /// The first branch of repositories created in Facet.
+    pub default_branch: String,
+    pub editor: Editor,
+    pub terminal: Terminal,
 }
 
 /// An external diff and/or merge tool for some file extensions. Commands are command lines
@@ -245,10 +352,11 @@ impl Default for Settings {
             command_log_visible: false,
             command_log_height: 200.0,
             changes_width: 340.0,
-            commit_box_height: 148.0,
+            commit_box_height: 214.0,
             image_mode: ImageMode::default(),
             detail_width: 520.0,
             pull_mode: PullMode::default(),
+            history_all_branches: true,
             collapsed_sections: Vec::new(),
             perf_offer_declined: Vec::new(),
             recent_repos: Vec::new(),
@@ -259,6 +367,15 @@ impl Default for Settings {
             git_path: None,
             ui_scale: 1.0,
             code_font: CodeFont::default(),
+            code_font_size: 13.0,
+            windows_accent: true,
+            density: Density::default(),
+            auto_fetch: true,
+            split_diff: false,
+            fetch_minutes: 5,
+            default_branch: "main".to_owned(),
+            editor: Editor::default(),
+            terminal: Terminal::default(),
         }
     }
 }
@@ -335,9 +452,18 @@ impl Settings {
         self.sidebar_width = clamp_or(self.sidebar_width, SIDEBAR_WIDTH, 240.0);
         self.command_log_height = clamp_or(self.command_log_height, COMMAND_LOG_HEIGHT, 200.0);
         self.changes_width = clamp_or(self.changes_width, CHANGES_WIDTH, 340.0);
-        self.commit_box_height = clamp_or(self.commit_box_height, COMMIT_BOX_HEIGHT, 148.0);
+        // Composers sized for the old, single-field commit box get the new default.
+        if self.commit_box_height < *COMMIT_BOX_HEIGHT.start() {
+            self.commit_box_height = 214.0;
+        }
+        self.commit_box_height = clamp_or(self.commit_box_height, COMMIT_BOX_HEIGHT, 214.0);
         self.detail_width = clamp_or(self.detail_width, DETAIL_WIDTH, 520.0);
         self.ui_scale = clamp_or(self.ui_scale, UI_SCALE, 1.0);
+        self.code_font_size = clamp_or(self.code_font_size, 10.0..=20.0, 13.0);
+        self.fetch_minutes = self.fetch_minutes.clamp(1, 240);
+        if !valid_branch_name(&self.default_branch) {
+            self.default_branch = "main".to_owned();
+        }
         if self
             .git_path
             .as_ref()
@@ -358,6 +484,17 @@ impl Settings {
         }
     }
 
+    /// The default branch name as typed: kept only if git would accept it.
+    pub fn set_default_branch(&mut self, name: &str) -> bool {
+        let name = name.trim();
+        if valid_branch_name(name) {
+            name.clone_into(&mut self.default_branch);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Record `path` as the most recently used repository.
     pub fn touch_recent(&mut self, path: &Path) {
         self.recent_repos.retain(|p| !same_path(p, path));
@@ -368,6 +505,23 @@ impl Settings {
     pub fn forget_recent(&mut self, path: &Path) {
         self.recent_repos.retain(|p| !same_path(p, path));
     }
+}
+
+/// The rules of `git check-ref-format --branch` that a typed name can break (checked here
+/// without running git, since settings are saved as they are typed).
+fn valid_branch_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with(['-', '/', '.'])
+        && !name.ends_with(['/', '.'])
+        && !name.ends_with(".lock")
+        && !name.contains("..")
+        && !name.contains("//")
+        && !name.contains("@{")
+        && name != "@"
+        && !name.contains("/.")
+        && !name
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || "~^:?*[\\".contains(c))
 }
 
 fn clamp_or(value: f32, range: std::ops::RangeInclusive<f32>, fallback: f32) -> f32 {

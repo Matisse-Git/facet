@@ -13,7 +13,20 @@ use crate::app::{describe_error, Event, FacetApp, GitStatus};
 use crate::gitignore::{self, Template, Written};
 use crate::integrations::{self, Installed, OpenTarget, Places};
 use crate::platform::{self, Chrome};
-use crate::settings::{CodeFont, UI_SCALE};
+use crate::settings::{CodeFont, Density, UI_SCALE};
+use crate::ui::prompt::{Prompt, PromptField, PromptKind};
+
+/// The hosting services settings can sign in to: display name and host.
+pub const ACCOUNT_HOSTS: [(&str, &str); 2] = [("GitHub", "github.com"), ("GitLab", "gitlab.com")];
+
+/// Which page of settings is shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SettingsPage {
+    #[default]
+    Main,
+    /// Git executable, interface size, diff and merge tools, open in, `.gitignore` templates.
+    Advanced,
+}
 
 /// The open settings view.
 pub struct SettingsView {
@@ -26,6 +39,22 @@ pub struct SettingsView {
     pub preview: GitignorePreview,
     /// Scroll the `.gitignore` section into view on the next frame.
     pub reveal_gitignore: bool,
+    pub page: SettingsPage,
+    /// The "Find a setting" box.
+    pub find: String,
+    /// The default branch name as typed.
+    pub default_branch: String,
+    /// Accounts the credential store holds per host of [`ACCOUNT_HOSTS`] (`None`: still
+    /// reading).
+    pub accounts: Option<Vec<Vec<String>>>,
+    /// A sign-in or sign-out running on this host.
+    pub account_busy: Option<String>,
+    /// Who commits are made as (`None`: still reading).
+    pub identity: Option<facet_git::Identity>,
+    /// `git lfs version` (`None`: still checking; `Some(None)`: not installed).
+    pub lfs: Option<Option<String>>,
+    /// The active repository's `core.autocrlf` (`None`: reading, or no repository).
+    pub line_endings: Option<facet_git::LineEndings>,
 }
 
 pub enum GitignorePreview {
@@ -60,6 +89,25 @@ pub enum SettingsEvent {
         result: Result<Option<Written>, String>,
     },
     GitignoreRestored(Result<(), String>),
+    Accounts(Vec<Vec<String>>),
+    Identity(Result<facet_git::Identity, GitError>),
+    SignedIn {
+        host: String,
+        result: Result<String, GitError>,
+    },
+    SignedOut {
+        host: String,
+        result: Result<(), GitError>,
+    },
+    AuthorSet(Result<(), GitError>),
+    Lfs(Option<String>),
+    LineEndings(Option<facet_git::LineEndings>),
+    LineEndingsSet(Result<(), GitError>),
+    /// The background fetch of a repository finished (`Err`: it failed; nothing is shown).
+    BackgroundFetched {
+        root: PathBuf,
+        ok: bool,
+    },
     /// A second launch handed over (`None`: it had no path).
     Forwarded(Option<PathBuf>),
 }
@@ -103,13 +151,217 @@ impl FacetApp {
             template: Template::Unity,
             preview: GitignorePreview::None,
             reveal_gitignore: false,
+            page: SettingsPage::Main,
+            find: String::new(),
+            default_branch: self.settings.default_branch.clone(),
+            accounts: None,
+            account_busy: None,
+            identity: None,
+            lfs: None,
+            line_endings: None,
         });
         if let Some(template) = template {
             view.template = template;
+            view.page = SettingsPage::Advanced;
             view.reveal_gitignore = true;
         }
         self.palette.open = false;
         self.request_gitignore_preview();
+        self.read_accounts();
+        self.read_identity();
+        self.read_line_endings();
+        if self.settings_view.as_ref().is_some_and(|view| view.lfs.is_none()) {
+            let git = self.git.clone();
+            self.spawn(async move {
+                Event::Settings(SettingsEvent::Lfs(facet_git::lfs_version(&git).await))
+            });
+        }
+    }
+
+    /// `core.autocrlf` in the active repository.
+    fn read_line_endings(&self) {
+        let Some(root) = self.work_root() else {
+            return;
+        };
+        let git = self.git.clone();
+        self.spawn(async move {
+            Event::Settings(SettingsEvent::LineEndings(
+                facet_git::line_endings(&git, &root).await.ok(),
+            ))
+        });
+    }
+
+    fn set_line_endings(&mut self, mode: facet_git::LineEndings) {
+        let Some(root) = self.work_root() else {
+            return;
+        };
+        if let Some(view) = &mut self.settings_view {
+            view.line_endings = Some(mode);
+        }
+        let git = self.git.clone();
+        self.spawn(async move {
+            Event::Settings(SettingsEvent::LineEndingsSet(
+                facet_git::set_line_endings(&git, &root, mode).await,
+            ))
+        });
+    }
+
+    /// Versions and paths for a bug report, on the clipboard.
+    fn copy_diagnostics(&mut self) {
+        let git = match &self.git_status {
+            GitStatus::Checking => "checking".to_owned(),
+            GitStatus::Found(version) => version.to_string(),
+            GitStatus::Missing(_) => "not found".to_owned(),
+        };
+        let lfs = self
+            .settings_view
+            .as_ref()
+            .and_then(|view| view.lfs.clone())
+            .flatten()
+            .unwrap_or_else(|| "not installed or not checked".to_owned());
+        let text = format!(
+            "{}
+Windows {}
+Git {git} ({})
+Git LFS: {lfs}
+Interface size: {:.0}%
+Theme: {:?}
+",
+            crate::ui::version_label(),
+            std::env::consts::ARCH,
+            self.settings
+                .git_path
+                .as_ref()
+                .map_or_else(|| "PATH".to_owned(), |path| path.display().to_string()),
+            self.settings.ui_scale * 100.0,
+            self.settings.theme,
+        );
+        self.ctx.copy_text(text);
+        self.info_toast("Diagnostics copied");
+    }
+
+    /// Who is signed in to each host of [`ACCOUNT_HOSTS`] (the Windows credential store).
+    fn read_accounts(&self) {
+        self.settings_work(|| {
+            SettingsEvent::Accounts(
+                ACCOUNT_HOSTS
+                    .iter()
+                    .map(|(_, host)| facet_git::stored_accounts(host))
+                    .collect(),
+            )
+        });
+    }
+
+    /// The commit author in the active repository (or the global one without a repository).
+    fn read_identity(&self) {
+        let git = self.git.clone();
+        let root = self.work_root();
+        self.spawn(async move {
+            Event::Settings(SettingsEvent::Identity(
+                facet_git::identity(&git, root.as_deref()).await,
+            ))
+        });
+    }
+
+    fn sign_in(&mut self, host: String) {
+        if let Some(view) = &mut self.settings_view {
+            if view.account_busy.is_some() {
+                return;
+            }
+            view.account_busy = Some(host.clone());
+        }
+        let git = self.git.clone();
+        self.spawn(async move {
+            let result = facet_git::sign_in(&git, &host).await;
+            Event::Settings(SettingsEvent::SignedIn { host, result })
+        });
+    }
+
+    fn sign_out(&mut self, host: String) {
+        if let Some(view) = &mut self.settings_view {
+            if view.account_busy.is_some() {
+                return;
+            }
+            view.account_busy = Some(host.clone());
+        }
+        let git = self.git.clone();
+        self.spawn(async move {
+            let result = facet_git::sign_out(&git, &host, None).await;
+            Event::Settings(SettingsEvent::SignedOut { host, result })
+        });
+    }
+
+    fn edit_commit_author(&mut self) {
+        if self.work_root().is_none() {
+            self.info_toast("Open a repository first: Facet sets the author per repository");
+            return;
+        }
+        let (name, email) = self
+            .settings_view
+            .as_ref()
+            .and_then(|view| view.identity.as_ref())
+            .map(|identity| (identity.name.clone(), identity.email.clone()))
+            .unwrap_or_default();
+        self.prompt = Some(
+            Prompt::new(PromptKind::CommitAuthor, "Commit Author", "Save")
+                .body(
+                    "Saved in this repository's own Git config. Facet never changes your \
+                     global Git config.",
+                )
+                .field(PromptField::new("Name", "Your name", true).with_value(&name))
+                .field(PromptField::new("Email", "you@example.com", true).with_value(&email)),
+        );
+    }
+
+    fn set_commit_author(&mut self, name: String, email: String) {
+        let Some(root) = self.work_root() else {
+            return;
+        };
+        let git = self.git.clone();
+        self.spawn(async move {
+            let result =
+                facet_git::set_local_identity(&git, &root, name.trim(), email.trim()).await;
+            Event::Settings(SettingsEvent::AuthorSet(result))
+        });
+    }
+
+    /// Fetch every ready repository whose last fetch is older than the interval in settings.
+    /// Called every frame; does nothing most of the time.
+    pub(crate) fn background_fetch(&mut self) {
+        if !self.settings.auto_fetch || !matches!(self.git_status, GitStatus::Found(_)) {
+            return;
+        }
+        let interval = std::time::Duration::from_secs(u64::from(self.settings.fetch_minutes) * 60);
+        let now = std::time::Instant::now();
+        let mut due = Vec::new();
+        for tab in &mut self.tabs {
+            let Some(root) = crate::app_work::ready_info(tab).map(|info| info.root().to_owned())
+            else {
+                continue;
+            };
+            if tab.refs.snapshot.remotes.is_empty() || tab.network.is_some() {
+                continue;
+            }
+            match tab.auto_fetch {
+                Some(last) if now.duration_since(last) < interval => continue,
+                // The first fetch waits a little after the repository opens.
+                None => {
+                    tab.auto_fetch = Some(now - interval + std::time::Duration::from_secs(20));
+                    continue;
+                }
+                _ => {}
+            }
+            tab.auto_fetch = Some(now);
+            due.push(root);
+        }
+        for root in due {
+            let git = self.git.clone();
+            self.spawn(async move {
+                let ok = facet_git::fetch_in_background(&git, &root).await.is_ok();
+                Event::Settings(SettingsEvent::BackgroundFetched { root, ok })
+            });
+        }
+        self.ctx.request_repaint_after(std::time::Duration::from_secs(10));
     }
 
     /// Recompute the `.gitignore` preview for the active repository and chosen template.
@@ -279,6 +531,82 @@ impl FacetApp {
                 }
                 self.request_gitignore_preview();
             }
+            SettingsEvent::Accounts(accounts) => {
+                if let Some(view) = &mut self.settings_view {
+                    view.accounts = Some(accounts);
+                }
+            }
+            SettingsEvent::Identity(result) => {
+                if let Some(view) = &mut self.settings_view {
+                    view.identity = Some(result.unwrap_or_default());
+                }
+            }
+            SettingsEvent::SignedIn { host, result } => {
+                if let Some(view) = &mut self.settings_view {
+                    view.account_busy = None;
+                }
+                match result {
+                    Ok(user) if user.is_empty() => self.info_toast(format!("Signed in to {host}")),
+                    Ok(user) => self.info_toast(format!("Signed in to {host} as {user}")),
+                    Err(error) => {
+                        let (title, detail) = describe_error(&error);
+                        self.error_toast(format!("Couldn't sign in to {host}"), detail.or(Some(title)));
+                    }
+                }
+                self.read_accounts();
+            }
+            SettingsEvent::SignedOut { host, result } => {
+                if let Some(view) = &mut self.settings_view {
+                    view.account_busy = None;
+                }
+                match result {
+                    Ok(()) => self.info_toast(format!("Signed out of {host}")),
+                    Err(error) => {
+                        let (title, detail) = describe_error(&error);
+                        self.error_toast(format!("Couldn't sign out of {host}"), detail.or(Some(title)));
+                    }
+                }
+                self.read_accounts();
+            }
+            SettingsEvent::AuthorSet(result) => {
+                match result {
+                    Ok(()) => self.info_toast("Commit author saved for this repository"),
+                    Err(error) => {
+                        let (title, detail) = describe_error(&error);
+                        self.error_toast("Couldn't set the commit author", detail.or(Some(title)));
+                    }
+                }
+                self.read_identity();
+            }
+            SettingsEvent::Lfs(version) => {
+                if let Some(view) = &mut self.settings_view {
+                    view.lfs = Some(version);
+                }
+            }
+            SettingsEvent::LineEndings(mode) => {
+                if let Some(view) = &mut self.settings_view {
+                    view.line_endings = mode;
+                }
+            }
+            SettingsEvent::LineEndingsSet(result) => {
+                if let Err(error) = result {
+                    let (title, detail) = describe_error(&error);
+                    self.error_toast("Couldn't change line endings", detail.or(Some(title)));
+                }
+                self.read_line_endings();
+            }
+            SettingsEvent::BackgroundFetched { root, ok } => {
+                if ok {
+                    let found = self.tabs.iter().position(|tab| {
+                        crate::app_work::ready_info(tab).is_some_and(|info| {
+                            crate::settings::same_path(info.root(), &root)
+                        })
+                    });
+                    if let Some(index) = found {
+                        self.request_refs(index);
+                    }
+                }
+            }
             SettingsEvent::Forwarded(path) => {
                 if let Some(chrome) = self.chrome {
                     chrome.bring_to_front();
@@ -345,7 +673,93 @@ impl FacetApp {
     /// action back if it is not one of them.
     pub(crate) fn run_settings_action(&mut self, action: Action) -> Option<Action> {
         match action {
-            Action::ShowSettings => self.show_settings(None),
+            Action::ShowSettings => {
+                self.show_settings(None);
+                if let Some(view) = &mut self.settings_view {
+                    view.page = SettingsPage::Main;
+                }
+            }
+            Action::ShowAdvancedSettings => {
+                self.show_settings(None);
+                if let Some(view) = &mut self.settings_view {
+                    view.page = SettingsPage::Advanced;
+                }
+            }
+            Action::SetWindowsAccent(on) => {
+                self.settings.windows_accent = on;
+                crate::theme::set_accent(&self.ctx, on.then(platform::windows_accent).flatten());
+            }
+            Action::SetCodeFontSize(size) => {
+                self.settings.code_font_size = size.clamp(10.0, 20.0);
+                crate::theme::set_mono_size(self.settings.code_font_size);
+                crate::theme::restyle(&self.ctx);
+            }
+            Action::SetDensity(density) => {
+                self.settings.density = density;
+                crate::theme::set_compact(density == Density::Compact);
+            }
+            Action::SetAutoFetch(on) => self.settings.auto_fetch = on,
+            Action::SetFetchMinutes(minutes) => {
+                self.settings.fetch_minutes = minutes.clamp(1, 240);
+                self.settings.auto_fetch = true;
+            }
+            Action::SetDefaultBranch(name) => {
+                if !self.settings.set_default_branch(&name) {
+                    self.error_toast(
+                        format!("“{}” can't be a branch name", name.trim()),
+                        Some("Branch names can't have spaces, “..”, or ~ ^ : ? * [ \\.".to_owned()),
+                    );
+                    if let Some(view) = &mut self.settings_view {
+                        view.default_branch = self.settings.default_branch.clone();
+                    }
+                }
+            }
+            Action::SetEditor(editor) => self.settings.editor = editor,
+            Action::SetTerminal(terminal) => self.settings.terminal = terminal,
+            Action::SignIn(host) => self.sign_in(host),
+            Action::SignOut(host) => self.sign_out(host),
+            Action::EditCommitAuthor => self.edit_commit_author(),
+            Action::SetLineEndings(mode) => self.set_line_endings(mode),
+            Action::CopyDiagnostics => self.copy_diagnostics(),
+            Action::SetCommitAuthor { name, email } => self.set_commit_author(name, email),
+            Action::ManageCredentials => {
+                if let Err(error) = platform::open_credential_manager() {
+                    self.error_toast("Couldn't open Credential Manager", Some(error.to_string()));
+                }
+            }
+            Action::OpenTerminal => {
+                if let Some(root) = self.work_root() {
+                    let git = self.git.exe().to_owned();
+                    let git = which_git(&git);
+                    if let Err(error) = integrations::open_terminal(
+                        self.settings.terminal,
+                        &self.installed,
+                        &root,
+                        &git,
+                    ) {
+                        self.error_toast(
+                            format!("Couldn't open {}", self.settings.terminal.label()),
+                            Some(error.to_string()),
+                        );
+                    }
+                }
+            }
+            Action::OpenInEditor(file) => {
+                if let Some(root) = self.work_root() {
+                    let file = file.map(PathBuf::from);
+                    if let Err(error) = integrations::open_in_editor(
+                        self.settings.editor,
+                        &self.installed,
+                        &root,
+                        file.as_deref(),
+                    ) {
+                        self.error_toast(
+                            format!("Couldn't open {}", self.settings.editor.label()),
+                            Some(error.to_string()),
+                        );
+                    }
+                }
+            }
             Action::CloseSettings => self.settings_view = None,
             Action::SetUiScale(scale) => {
                 let scale = scale.clamp(*UI_SCALE.start(), *UI_SCALE.end());
@@ -386,4 +800,18 @@ impl FacetApp {
         }
         None
     }
+}
+
+/// The full path of `git` (a bare name is looked up on `PATH`), for finding what came with it.
+fn which_git(git: &std::path::Path) -> PathBuf {
+    if git.components().count() > 1 {
+        return git.to_owned();
+    }
+    std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join("git.exe"))
+                .find(|candidate| candidate.is_file())
+        })
+        .unwrap_or_else(|| git.to_owned())
 }

@@ -650,3 +650,81 @@ pub fn pick_file(
         result.map_err(|error| error.message())
     }
 }
+
+/// The accent color picked in Windows, as Windows 11 itself uses it: the darker shade on light
+/// backgrounds and the lighter one on dark (`AccentPalette`: light 3…1, base, dark 1…3).
+/// Returns `(for light mode, for dark mode)`, or `None` when it can't be read.
+pub fn windows_accent() -> Option<([u8; 3], [u8; 3])> {
+    use windows::core::w;
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_BINARY};
+
+    let mut data = [0u8; 32];
+    let mut size = data.len() as u32;
+    // SAFETY: `data` is a writable buffer of `size` bytes.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent"),
+            w!("AccentPalette"),
+            RRF_RT_REG_BINARY,
+            None,
+            Some(data.as_mut_ptr().cast()),
+            Some(&mut size),
+        )
+    };
+    if status.is_err() || size < 28 {
+        return None;
+    }
+    let color = |index: usize| [data[index * 4], data[index * 4 + 1], data[index * 4 + 2]];
+    Some((color(4), color(1)))
+}
+
+/// Open a file for editing with the app Windows uses for its type (the shell's "edit" verb,
+/// else "open"). Programs and scripts are never run: for those only "edit" is tried.
+pub fn edit_file(path: &Path) -> std::io::Result<()> {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    const RUNNABLE: [&str; 20] = [
+        "exe", "com", "bat", "cmd", "ps1", "psm1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "msi",
+        "msp", "lnk", "scr", "hta", "cpl", "pif", "reg",
+    ];
+    let extension = path
+        .extension()
+        .map(|ext| ext.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let shell = |verb: &str| {
+        // SAFETY: all strings are valid, NUL-terminated HSTRINGs that outlive the call.
+        let result = unsafe {
+            ShellExecuteW(
+                None,
+                &HSTRING::from(verb),
+                &HSTRING::from(path.as_os_str()),
+                None,
+                None,
+                SW_SHOWNORMAL,
+            )
+        };
+        // ShellExecute reports success with a value greater than 32.
+        result.0 as isize > 32
+    };
+    if shell("edit") || (!RUNNABLE.contains(&extension.as_str()) && shell("open")) {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "Windows has no app to edit {} files",
+            if extension.is_empty() {
+                "these".to_owned()
+            } else {
+                format!(".{extension}")
+            }
+        )))
+    }
+}
+
+/// The Windows Credential Manager control panel (saved sign-ins for git servers).
+pub fn open_credential_manager() -> std::io::Result<()> {
+    std::process::Command::new("control.exe")
+        .args(["/name", "Microsoft.CredentialManager"])
+        .spawn()
+        .map(drop)
+}

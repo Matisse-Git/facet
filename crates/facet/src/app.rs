@@ -101,6 +101,8 @@ pub struct RepoTab {
     pub power: PowerState,
     /// Git LFS: usage, attributes of the listed files, locks.
     pub lfs: LfsState,
+    /// When the background fetch last ran here (`None`: not yet scheduled).
+    pub(crate) auto_fetch: Option<std::time::Instant>,
 }
 
 impl RepoTab {
@@ -156,6 +158,8 @@ pub struct FacetApp {
     pub prompt: Option<Prompt>,
     /// The settings view, while open.
     pub settings_view: Option<SettingsView>,
+    /// Open the branch flyout on the next frame (the sidebar's Branches item).
+    pub(crate) open_branches: bool,
     /// The Add Repository dialog, while open.
     pub add_view: Option<crate::app_add::AddRepoView>,
     /// The dialog's tab when it was last closed; it opens there again.
@@ -194,7 +198,12 @@ impl FacetApp {
         instance: Option<crate::instance::Server>,
     ) -> Self {
         let ctx = cc.egui_ctx.clone();
+        theme::set_mono_size(settings.code_font_size);
+        theme::set_compact(settings.density == crate::settings::Density::Compact);
         theme::install(&ctx, settings.theme, settings.code_font);
+        if settings.windows_accent {
+            theme::set_accent(&ctx, crate::platform::windows_accent());
+        }
         ctx.set_zoom_factor(settings.ui_scale);
 
         let dark = ctx.theme() == egui::Theme::Dark;
@@ -245,6 +254,7 @@ impl FacetApp {
             confirm: None,
             prompt: None,
             settings_view: None,
+            open_branches: false,
             add_view: None,
             last_add_tab: crate::app_add::AddTab::default(),
             installed: Installed::default(),
@@ -388,6 +398,7 @@ impl FacetApp {
             network: None,
             power: PowerState::default(),
             lfs: LfsState::default(),
+            auto_fetch: None,
         });
         let index = self.tabs.len() - 1;
         if activate || self.active.is_none() {
@@ -563,6 +574,10 @@ impl FacetApp {
             command_log_empty: self.command_log.is_empty(),
             ui_scale: self.settings.ui_scale,
             code_font: self.settings.code_font,
+            code_font_size: self.settings.code_font_size,
+            windows_accent: self.settings.windows_accent,
+            density: self.settings.density,
+            auto_fetch: self.settings.auto_fetch,
             custom_git: self.settings.git_path.is_some(),
             open_in: &open_in,
         })
@@ -779,6 +794,16 @@ impl FacetApp {
                     && (tab.history.filter.is_some() || tab.power.search.open),
             )
         });
+        let file_open = self.active_tab().is_some_and(|tab| {
+            tab.view == View::History && tab.history.commit.selected_file.is_some()
+        });
+        if file_open
+            && ctx.memory(|memory| memory.focused().is_none())
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            self.pending.push(Action::CloseCommitFile);
+            return;
+        }
         if (blame || filtered)
             && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
@@ -1021,7 +1046,7 @@ impl FacetApp {
             return;
         };
         let history = &mut tab.history;
-        let height = history.commits.len() as f32 * crate::ui::COMMIT_ROW;
+        let height = history.commits.len() as f32 * crate::ui::commit_row_height();
         match bench.step(previous_cpu_secs, height) {
             Some(offset) => {
                 history.scroll_to = Some(offset);
@@ -1136,6 +1161,7 @@ impl eframe::App for FacetApp {
         self.handle_shortcuts(&ctx);
         self.handle_dropped_files(&ctx);
         self.refresh_on_focus(&ctx);
+        self.background_fetch();
         self.show_next_askpass();
 
         self.layout(ui);

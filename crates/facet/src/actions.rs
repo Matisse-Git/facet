@@ -21,7 +21,10 @@ use crate::gitignore::{Template, Written};
 use crate::history::View;
 use crate::integrations::{OpenTarget, ToolPreset};
 use crate::power::UndoItem;
-use crate::settings::{CodeFont, ExternalTool, ImageMode, PullMode, ThemeMode, UI_SCALES};
+use crate::settings::{
+    CodeFont, Density, Editor, ExternalTool, ImageMode, PullMode, Terminal, ThemeMode,
+    fetch_interval_label, CODE_FONT_SIZES, FETCH_INTERVALS, UI_SCALES,
+};
 use crate::workspace::Area;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -109,6 +112,8 @@ pub enum Action {
     CopySelectedLines,
     CopyFilePath,
     SetImageMode(ImageMode),
+    /// Text diffs side by side (`true`) or unified.
+    SetSplitDiff(bool),
 
     // ----- working copy: commit ------------------------------------------------------------
     Commit,
@@ -130,6 +135,8 @@ pub enum Action {
     /// Show this commit in the history (a branch, tag or stash clicked in the sidebar).
     RevealCommit(String),
     SelectCommitFile(usize),
+    /// Back from a file's diff to the commit it belongs to.
+    CloseCommitFile,
     /// Show the files of this stash (its position in the list) and their diffs.
     ShowStash(usize),
     SelectStashFile(usize),
@@ -146,6 +153,8 @@ pub enum Action {
         switch: bool,
     },
     SwitchBranch(String),
+    /// Open the branch flyout under the branch button of the title bar.
+    ShowBranches,
     /// Check out a remote-tracking branch (`origin/feature`) as a new local branch.
     CheckoutRemoteBranch(String),
     CheckoutCommit(String),
@@ -259,6 +268,8 @@ pub enum Action {
     RunSearch,
     /// Back to the full history from search results, a file's history or the reflog.
     ClearFilter,
+    /// The history shows every branch (`true`) or only the checked-out one.
+    SetHistoryAllBranches(bool),
     ShowFileHistory(String),
     ShowReflog,
     /// Who changed each line of a file: in the working copy (`rev: None`) or at a commit.
@@ -345,7 +356,41 @@ pub enum Action {
 
     // ----- settings and integrations (M4) -------------------------------------------------
     ShowSettings,
+    /// Settings' Advanced page: git executable, interface size, tools, templates.
+    ShowAdvancedSettings,
     CloseSettings,
+    /// Use the accent color picked in Windows (or Facet's own blue).
+    SetWindowsAccent(bool),
+    SetCodeFontSize(f32),
+    SetDensity(Density),
+    /// Fetch every open repository in the background.
+    SetAutoFetch(bool),
+    /// How often the background fetch runs, in minutes.
+    SetFetchMinutes(u32),
+    /// The first branch of repositories created in Facet.
+    SetDefaultBranch(String),
+    SetEditor(Editor),
+    SetTerminal(Terminal),
+    /// Sign in to a hosting service through Git Credential Manager (`github.com`).
+    SignIn(String),
+    /// Make the credential helper forget the account on a host.
+    SignOut(String),
+    /// Ask for the commit author's name and email (kept in the repository's own config).
+    EditCommitAuthor,
+    SetCommitAuthor {
+        name: String,
+        email: String,
+    },
+    /// How the active repository converts line endings (`core.autocrlf`, repo-local).
+    SetLineEndings(facet_git::LineEndings),
+    /// Copy versions and paths for a bug report.
+    CopyDiagnostics,
+    /// The Windows Credential Manager control panel.
+    ManageCredentials,
+    /// Open the repository in the terminal chosen in settings.
+    OpenTerminal,
+    /// Open the repository (or a file in it) in the editor chosen in settings.
+    OpenInEditor(Option<String>),
     /// Interface size (egui zoom factor).
     SetUiScale(f32),
     SetCodeFont(CodeFont),
@@ -376,7 +421,9 @@ pub mod shortcut {
 
     const CTRL_SHIFT: Modifiers = Modifiers::CTRL.plus(Modifiers::SHIFT);
 
-    pub const PALETTE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::P);
+    pub const PALETTE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::K);
+    /// The palette's second shortcut, as in code editors.
+    pub const PALETTE_ALT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::P);
     pub const SETTINGS: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::Comma);
     pub const OPEN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::O);
     pub const CLOSE_TAB: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::W);
@@ -475,6 +522,10 @@ pub struct RepoContext {
     pub selected_commit: Option<(String, String)>,
     pub network_running: bool,
     pub pull_mode: PullMode,
+    /// The history shows every branch, not only the checked-out one.
+    pub all_branches: bool,
+    /// A file of the selected commit is open.
+    pub commit_file_open: bool,
     pub forge: Option<ForgeKind>,
     /// The working tree has changes to stash.
     pub dirty: bool,
@@ -526,6 +577,10 @@ pub struct CommandContext<'a> {
     pub command_log_empty: bool,
     pub ui_scale: f32,
     pub code_font: CodeFont,
+    pub code_font_size: f32,
+    pub windows_accent: bool,
+    pub density: Density,
+    pub auto_fetch: bool,
     /// A git executable is chosen in settings (not the one on `PATH`).
     pub custom_git: bool,
     /// Programs the repository can be opened in (installed ones).
@@ -587,6 +642,8 @@ pub fn commands(cx: &CommandContext<'_>) -> Vec<Command> {
             Some(shortcut::COPY_PATH),
             Action::CopyRepositoryPath,
         );
+        add("Open in Terminal".into(), None, Action::OpenTerminal);
+        add("Open in External Editor".into(), None, Action::OpenInEditor(None));
         for target in cx.open_in {
             add(
                 format!("Open in {}", target.label()),
@@ -686,6 +743,77 @@ pub fn commands(cx: &CommandContext<'_>) -> Vec<Command> {
             );
         }
     }
+    for size in CODE_FONT_SIZES {
+        if (size - cx.code_font_size).abs() > 0.01 {
+            add(
+                format!("Code Font Size: {size:.0}"),
+                None,
+                Action::SetCodeFontSize(size),
+            );
+        }
+    }
+    add(
+        if cx.windows_accent {
+            "Accent Color: Facet Blue"
+        } else {
+            "Accent Color: Use the Windows Accent"
+        }
+        .into(),
+        None,
+        Action::SetWindowsAccent(!cx.windows_accent),
+    );
+    for density in Density::ALL {
+        if density != cx.density {
+            add(
+                format!("Density: {}", density.label()),
+                None,
+                Action::SetDensity(density),
+            );
+        }
+    }
+    add(
+        if cx.auto_fetch {
+            "Stop Fetching in the Background"
+        } else {
+            "Fetch in the Background"
+        }
+        .into(),
+        None,
+        Action::SetAutoFetch(!cx.auto_fetch),
+    );
+    for minutes in FETCH_INTERVALS {
+        add(
+            format!("Background Fetch: {}", fetch_interval_label(minutes)),
+            None,
+            Action::SetFetchMinutes(minutes),
+        );
+    }
+    for editor in Editor::ALL {
+        add(
+            format!("External Editor: {}", editor.label()),
+            None,
+            Action::SetEditor(editor),
+        );
+    }
+    for terminal in Terminal::ALL {
+        add(
+            format!("Terminal: {}", terminal.label()),
+            None,
+            Action::SetTerminal(terminal),
+        );
+    }
+    for (name, host) in [("GitHub", "github.com"), ("GitLab", "gitlab.com")] {
+        add(format!("Sign In to {name}"), None, Action::SignIn(host.into()));
+        add(format!("Sign Out of {name}"), None, Action::SignOut(host.into()));
+    }
+    add("Manage Saved Credentials".into(), None, Action::ManageCredentials);
+    add("Commit Author…".into(), None, Action::EditCommitAuthor);
+    add("Copy Diagnostics".into(), None, Action::CopyDiagnostics);
+    add(
+        "Settings: Advanced".into(),
+        None,
+        Action::ShowAdvancedSettings,
+    );
     add("Choose Git Executable…".into(), None, Action::BrowseGitPath);
     if cx.custom_git {
         add("Use Git from PATH".into(), None, Action::SetGitPath(None));
@@ -879,6 +1007,8 @@ fn work_commands(
     }
     if work.has_current {
         add("Copy File Path".into(), None, Action::CopyFilePath);
+        add("Diff Layout: Unified".into(), None, Action::SetSplitDiff(false));
+        add("Diff Layout: Split".into(), None, Action::SetSplitDiff(true));
     }
     if let Some(current) = work.image_mode {
         for mode in ImageMode::ALL {
@@ -1001,6 +1131,7 @@ fn repo_commands(
     }
 
     // Branches. `at: None` means "the selected commit in the history, else HEAD".
+    add("Branches…".into(), None, Action::ShowBranches);
     if repo.has_commits {
         let at = match &repo.selected_commit {
             Some((_, short)) if repo.view == View::History => format!(" at {short}"),
@@ -1310,6 +1441,20 @@ fn rewrite_commands(
             Action::ClearFilter,
         );
     }
+    if repo.has_commits {
+        add(
+            if repo.all_branches {
+                "History: Show Only the Current Branch".into()
+            } else {
+                "History: Show All Branches".into()
+            },
+            None,
+            Action::SetHistoryAllBranches(!repo.all_branches),
+        );
+    }
+    if repo.commit_file_open {
+        add("Back to the Commit".into(), None, Action::CloseCommitFile);
+    }
     if let Some((path, rev)) = &repo.current_file {
         let name = path.rsplit('/').next().unwrap_or(path);
         add(
@@ -1466,6 +1611,7 @@ pub const GLOBAL_SHORTCUTS: &[(KeyboardShortcut, Action)] = &[
     (shortcut::SHOW_CHANGES, Action::ShowChanges),
     (shortcut::SHOW_HISTORY, Action::ShowHistory),
     (shortcut::PALETTE, Action::ShowPalette),
+    (shortcut::PALETTE_ALT, Action::ShowPalette),
     (shortcut::OPEN, Action::ShowAddRepository(None)),
     (shortcut::CLOSE_TAB, Action::CloseActiveTab),
     (shortcut::REFRESH, Action::Refresh),
@@ -1492,6 +1638,10 @@ mod tests {
             command_log_empty: true,
             ui_scale: 1.0,
             code_font: CodeFont::CascadiaMono,
+            code_font_size: 13.0,
+            windows_accent: true,
+            density: Density::Comfortable,
+            auto_fetch: true,
             custom_git: false,
             open_in: &[],
         }
@@ -1532,6 +1682,8 @@ mod tests {
             selected_commit: Some(("4659738f".repeat(5), "4659738".into())),
             network_running: false,
             pull_mode: PullMode::FastForwardOnly,
+            all_branches: true,
+            commit_file_open: false,
             forge: Some(ForgeKind::GitHub),
             dirty: true,
             staged: true,

@@ -10,6 +10,7 @@
 //! * Nothing here touches the global git config, and hooks are never bypassed.
 //! * Every spawned command is recorded in the [`CommandLog`] exactly as executed.
 
+mod accounts;
 pub mod askpass;
 mod branch;
 mod clone;
@@ -40,6 +41,10 @@ mod submodule;
 pub mod tools;
 mod worktree;
 
+pub use accounts::{
+    identity, line_endings, set_line_endings, set_local_identity, sign_in, sign_out,
+    stored_accounts, Identity, LineEndings,
+};
 pub use branch::{
     create_branch, create_tag, delete_branch, delete_tag, rename_branch, restore_branch,
     restore_tag, set_upstream, switch, valid_branch_name, valid_tag_name, DeletedBranch,
@@ -56,8 +61,8 @@ pub use discard::{
 };
 pub use error::GitError;
 pub use history::{
-    blame, commit_detail, file_history, search_args, stream_log, stream_search, SearchKind,
-    LOG_ARGS,
+    blame, commit_detail, file_history, log_args, search_args, search_args_in, stream_log,
+    stream_log_in, stream_search, stream_search_in, Scope, SearchKind, LOG_ARGS,
 };
 pub use lfs::{
     lfs_attributes, lfs_lock, lfs_locks, lfs_pull, lfs_track, lfs_unlock, lfs_usage, lfs_version,
@@ -72,8 +77,8 @@ pub use operation::{
 pub use patch::{build_patch, PatchDirection, PatchError};
 pub use refs::{refs, RefsSnapshot};
 pub use remote::{
-    add_remote, fetch, pull, push, push_tag, remove_remote, restore_remote, Network, PullMode,
-    PushRequest,
+    add_remote, fetch, fetch_in_background, pull, push, push_tag, remove_remote, restore_remote,
+    Network, PullMode, PushRequest,
 };
 pub use repo::{commit_summary, discover, head, version, Head, RepoInfo};
 pub use runner::{Git, GitCommand, GitOutput, ProgressFn};
@@ -81,7 +86,7 @@ pub use stage::{apply_patch, stage_all, stage_paths, unstage_all, unstage_paths,
 pub use stash::{
     restore_stash, stash_apply, stash_drop, stash_files, stash_push, StashFile, StashOptions,
 };
-pub use status::{perf_config, set_perf_config, status, PerfConfig};
+pub use status::{line_counts, perf_config, set_perf_config, status, PerfConfig};
 pub use submodule::{submodule_range, submodules, sync_submodules, update_submodules};
 pub use tokio_util::sync::CancellationToken;
 pub use worktree::{

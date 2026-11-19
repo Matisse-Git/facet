@@ -98,6 +98,8 @@ pub struct RefsState {
     pub tips: Option<Vec<(String, String)>>,
     /// The tips the shown history was read for.
     pub history_tips: Option<Vec<(String, String)>>,
+    /// When the repository was last fetched (read with the refs).
+    pub last_fetch: Option<std::time::SystemTime>,
 }
 
 pub enum DetailBody {
@@ -590,6 +592,7 @@ mod tests {
             upstream: None,
             track: Track::None,
             date: 0,
+            author: String::new(),
         }
     }
 

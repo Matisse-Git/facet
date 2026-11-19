@@ -3,6 +3,7 @@
 //! Every view takes its colors from [`Palette`] and its metrics from the constants here, so the
 //! whole app stays on one 8pt grid with one accent color. Nothing else should hard-code a color.
 
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use eframe::egui::{
@@ -66,15 +67,12 @@ pub mod icon {
     /// GripperBarHorizontal: a drag handle.
     pub const GRIPPER: char = '\u{E76F}';
     pub const CHEVRON_RIGHT: char = '\u{E76C}';
-    pub const REMOVE: char = '\u{E738}';
     pub const UNDO: char = '\u{E7A7}';
     pub const CHECK: char = '\u{E73E}';
     pub const DOCUMENT: char = '\u{E8A5}';
     pub const LOCK: char = '\u{E72E}';
     pub const UNLOCK: char = '\u{E785}';
     pub const SETTINGS: char = '\u{E713}';
-    /// OpenInNewWindow.
-    pub const OPEN_IN: char = '\u{E8A7}';
     /// Sync (two arrows in a circle).
     pub const SYNC: char = '\u{E895}';
     /// BranchFork2.
@@ -87,6 +85,18 @@ pub mod icon {
     pub const DOWNLOAD: char = '\u{E896}';
     /// NewFolder: New repository.
     pub const NEW_FOLDER: char = '\u{E8F4}';
+    /// More: "⋯" menus.
+    pub const MORE: char = '\u{E712}';
+    /// Back arrow.
+    pub const BACK: char = '\u{E72B}';
+    /// Cloud: the Remotes section.
+    pub const CLOUD: char = '\u{E753}';
+    /// Tag: the Tags section.
+    pub const TAG: char = '\u{E8EC}';
+    /// Package (a box): the Stashes section.
+    pub const STASH: char = '\u{E7B8}';
+    /// Library: the Submodules section.
+    pub const SUBMODULE: char = '\u{E8F1}';
 }
 
 const FAMILY_SEMIBOLD: &str = "facet-semibold";
@@ -102,9 +112,29 @@ const JAPANESE_FONTS: [(&str, u32); 3] = [
     ("msgothic.ttc", 1), // MS UI Gothic
 ];
 
-/// Body text.
+/// Body text: rows, buttons, fields (the design's 13 px base size).
 pub fn body() -> FontId {
+    FontId::new(13.0, FontFamily::Proportional)
+}
+
+/// Larger body text: setting titles, a commit's message.
+pub fn large() -> FontId {
     FontId::new(14.0, FontFamily::Proportional)
+}
+
+/// Emphasized larger body text: card and section titles.
+pub fn large_strong() -> FontId {
+    FontId::new(14.0, FontFamily::Name(FAMILY_SEMIBOLD.into()))
+}
+
+/// Chips and key caps.
+pub fn caption() -> FontId {
+    FontId::new(11.0, FontFamily::Proportional)
+}
+
+/// Emphasized chips (branch names in the history, count pills).
+pub fn caption_strong() -> FontId {
+    FontId::new(11.0, FontFamily::Name(FAMILY_SEMIBOLD.into()))
 }
 
 /// Secondary text: captions, metadata, section labels.
@@ -114,7 +144,7 @@ pub fn small() -> FontId {
 
 /// Emphasized body text (active tab, row titles).
 pub fn strong() -> FontId {
-    FontId::new(14.0, FontFamily::Name(FAMILY_SEMIBOLD.into()))
+    FontId::new(13.0, FontFamily::Name(FAMILY_SEMIBOLD.into()))
 }
 
 /// Emphasized secondary text (section headers).
@@ -132,9 +162,45 @@ pub fn heading() -> FontId {
     FontId::new(20.0, FontFamily::Name(FAMILY_DISPLAY.into()))
 }
 
+/// Point size of the code font (a setting), as `f32` bits.
+static MONO_SIZE: AtomicU32 = AtomicU32::new(0x4150_0000); // 13.0
+/// Compact density (a setting): shorter rows.
+static COMPACT: AtomicBool = AtomicBool::new(false);
+
+pub fn set_mono_size(size: f32) {
+    MONO_SIZE.store(size.clamp(10.0, 20.0).to_bits(), Ordering::Relaxed);
+}
+
+fn mono_size() -> f32 {
+    f32::from_bits(MONO_SIZE.load(Ordering::Relaxed))
+}
+
+pub fn set_compact(compact: bool) {
+    COMPACT.store(compact, Ordering::Relaxed);
+}
+
+/// Rows are drawn shorter (the Compact density).
+pub fn compact() -> bool {
+    COMPACT.load(Ordering::Relaxed)
+}
+
+/// `comfortable` in the Comfortable density, `compact` in the Compact one.
+pub fn dense(comfortable: f32, compact: f32) -> f32 {
+    if self::compact() {
+        compact
+    } else {
+        comfortable
+    }
+}
+
 /// Code, object ids, command lines.
 pub fn mono() -> FontId {
-    FontId::new(13.0, FontFamily::Monospace)
+    FontId::new(mono_size(), FontFamily::Monospace)
+}
+
+/// Small code text: commit ids in chips, line counts.
+pub fn mono_small() -> FontId {
+    FontId::new(mono_size() - 1.5, FontFamily::Monospace)
 }
 
 /// An icon glyph at `size` points.
@@ -143,7 +209,7 @@ pub fn icon_font(size: f32) -> FontId {
 }
 
 /// All colors used by the UI, for one appearance.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Palette {
     pub dark: bool,
     /// Solid surface for content areas (lists, diffs, detail views). Chrome areas (title bar,
@@ -151,6 +217,10 @@ pub struct Palette {
     pub surface: Color32,
     /// The quieter second surface inside content (file list column, settings cards).
     pub surface_alt: Color32,
+    /// The window's own backdrop color (behind settings' cards; Mica elsewhere).
+    pub chrome: Color32,
+    /// Fill of dropdowns, text boxes and the chosen segment of a segmented control.
+    pub control: Color32,
     /// Surface for things that float above content: palette, toasts, tooltips.
     pub raised: Color32,
     /// 1px dividers and outlines.
@@ -171,6 +241,8 @@ pub struct Palette {
     pub danger: Color32,
     pub success: Color32,
     pub warning: Color32,
+    /// The second lane of the history graph, and the second repository tile hue.
+    pub orange: Color32,
     /// Skeleton placeholder base and shimmer highlight.
     pub skeleton: Color32,
     pub skeleton_highlight: Color32,
@@ -183,8 +255,6 @@ pub struct Palette {
     pub diff_added_strong: Color32,
     pub diff_removed: Color32,
     pub diff_removed_strong: Color32,
-    /// Diff: hunk header row.
-    pub diff_hunk: Color32,
 }
 
 /// Straight-alpha color to egui's premultiplied `Color32`, usable in `const`.
@@ -199,6 +269,8 @@ pub const DARK: Palette = Palette {
     dark: true,
     surface: Color32::from_rgb(0x1C, 0x1C, 0x1C),
     surface_alt: Color32::from_rgb(0x24, 0x24, 0x24),
+    chrome: Color32::from_rgb(0x20, 0x20, 0x20),
+    control: Color32::from_rgb(0x32, 0x32, 0x32),
     raised: Color32::from_rgb(0x2B, 0x2B, 0x2B),
     hairline: Color32::from_rgb(0x32, 0x32, 0x32),
     text: Color32::from_rgb(0xF2, 0xF2, 0xF2),
@@ -212,6 +284,7 @@ pub const DARK: Palette = Palette {
     danger: Color32::from_rgb(0xFF, 0x9C, 0x8F),
     success: Color32::from_rgb(0x6C, 0xCB, 0x8A),
     warning: Color32::from_rgb(0xF2, 0xC6, 0x61),
+    orange: Color32::from_rgb(0xFF, 0xA6, 0x57),
     skeleton: rgba(255, 255, 255, 14),
     skeleton_highlight: rgba(255, 255, 255, 30),
     scrim: rgba(0, 0, 0, 110),
@@ -220,13 +293,14 @@ pub const DARK: Palette = Palette {
     diff_added_strong: rgba(0x2E, 0xA0, 0x43, 97),
     diff_removed: rgba(0xF8, 0x51, 0x49, 31),
     diff_removed_strong: rgba(0xF8, 0x51, 0x49, 92),
-    diff_hunk: rgba(0x60, 0xCD, 0xFF, 24),
 };
 
 pub const LIGHT: Palette = Palette {
     dark: false,
     surface: Color32::from_rgb(0xFF, 0xFF, 0xFF),
     surface_alt: Color32::from_rgb(0xF9, 0xF9, 0xF9),
+    chrome: Color32::from_rgb(0xF3, 0xF3, 0xF3),
+    control: Color32::from_rgb(0xF9, 0xF9, 0xF9),
     raised: Color32::from_rgb(0xFF, 0xFF, 0xFF),
     hairline: Color32::from_rgb(0xE5, 0xE5, 0xE5),
     text: Color32::from_rgb(0x1A, 0x1A, 0x1A),
@@ -240,6 +314,7 @@ pub const LIGHT: Palette = Palette {
     danger: Color32::from_rgb(0xC4, 0x2B, 0x1C),
     success: Color32::from_rgb(0x0F, 0x7B, 0x3F),
     warning: Color32::from_rgb(0x8A, 0x5A, 0x00),
+    orange: Color32::from_rgb(0xB3, 0x59, 0x00),
     skeleton: rgba(0, 0, 0, 14),
     skeleton_highlight: rgba(0, 0, 0, 28),
     scrim: rgba(0, 0, 0, 56),
@@ -248,21 +323,56 @@ pub const LIGHT: Palette = Palette {
     diff_added_strong: rgba(0x2E, 0xA0, 0x43, 72),
     diff_removed: rgba(0xE5, 0x3E, 0x2E, 22),
     diff_removed_strong: rgba(0xE5, 0x3E, 0x2E, 62),
-    diff_hunk: rgba(0x00, 0x67, 0xC0, 18),
 };
+
+/// The palettes in effect when the accent is Windows' (leaked, replaced only when the setting
+/// or the Windows accent changes); null: [`LIGHT`] / [`DARK`] as they are.
+static LIGHT_NOW: AtomicPtr<Palette> = AtomicPtr::new(std::ptr::null_mut());
+static DARK_NOW: AtomicPtr<Palette> = AtomicPtr::new(std::ptr::null_mut());
 
 impl Palette {
     /// The palette for the appearance currently in effect.
     pub fn of(ctx: &egui::Context) -> &'static Self {
-        match ctx.theme() {
-            Theme::Dark => &DARK,
-            Theme::Light => &LIGHT,
+        Self::for_theme(ctx.theme())
+    }
+
+    pub fn for_theme(theme: Theme) -> &'static Self {
+        let (now, fallback) = match theme {
+            Theme::Dark => (&DARK_NOW, &DARK),
+            Theme::Light => (&LIGHT_NOW, &LIGHT),
+        };
+        let palette = now.load(Ordering::Acquire);
+        if palette.is_null() {
+            fallback
+        } else {
+            // SAFETY: only ever set to a leaked `Box<Palette>`, never freed.
+            unsafe { &*palette }
+        }
+    }
+
+    /// This palette with another accent color (and the colors made from it).
+    fn with_accent(&self, [r, g, b]: [u8; 3]) -> Self {
+        let luminance = 0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b);
+        Self {
+            accent: Color32::from_rgb(r, g, b),
+            on_accent: if luminance > 150.0 {
+                Color32::from_rgb(0x00, 0x00, 0x00)
+            } else {
+                Color32::WHITE
+            },
+            accent_soft: rgba(r, g, b, if self.dark { 36 } else { 26 }),
+            ..self.clone()
         }
     }
 
     /// 1px stroke in the hairline color.
     pub fn hairline_stroke(&self) -> Stroke {
         Stroke::new(1.0, self.hairline)
+    }
+
+    /// A light tint of `color` for the background of a chip or badge drawn in `color`.
+    pub fn soft(&self, color: Color32) -> Color32 {
+        color.gamma_multiply(if self.dark { 0.16 } else { 0.1 })
     }
 }
 
@@ -283,9 +393,34 @@ pub fn set_mode(ctx: &egui::Context, mode: ThemeMode) {
 /// Install fonts and both styles. Call once at startup.
 pub fn install(ctx: &egui::Context, mode: ThemeMode, code_font: CodeFont) {
     ctx.set_fonts(font_definitions(code_font));
-    ctx.style_mut_of(Theme::Dark, |style| configure(style, &DARK));
-    ctx.style_mut_of(Theme::Light, |style| configure(style, &LIGHT));
+    restyle(ctx);
     set_mode(ctx, mode);
+}
+
+/// Use `accent` — `(for light mode, for dark mode)` — instead of Facet's own blue; `None` goes
+/// back to it.
+pub fn set_accent(ctx: &egui::Context, accent: Option<([u8; 3], [u8; 3])>) {
+    let (light, dark) = match accent {
+        Some((light, dark)) => (
+            Box::into_raw(Box::new(LIGHT.with_accent(light))),
+            Box::into_raw(Box::new(DARK.with_accent(dark))),
+        ),
+        None => (std::ptr::null_mut(), std::ptr::null_mut()),
+    };
+    // The palettes replaced are leaked on purpose: a frame may still hold `&'static` ones.
+    LIGHT_NOW.store(light, Ordering::Release);
+    DARK_NOW.store(dark, Ordering::Release);
+    restyle(ctx);
+}
+
+/// Apply the palettes (and text sizes) in effect to both of egui's styles.
+pub fn restyle(ctx: &egui::Context) {
+    ctx.style_mut_of(Theme::Dark, |style| {
+        configure(style, Palette::for_theme(Theme::Dark));
+    });
+    ctx.style_mut_of(Theme::Light, |style| {
+        configure(style, Palette::for_theme(Theme::Light));
+    });
 }
 
 fn configure(style: &mut egui::Style, palette: &Palette) {

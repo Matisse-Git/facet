@@ -13,7 +13,6 @@ use crate::app::{describe_error, Event, FacetApp};
 use crate::platform::{self, Chrome};
 
 /// The branch a new repository starts on.
-pub const INITIAL_BRANCH: &str = "main";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AddTab {
@@ -55,6 +54,8 @@ impl AddRunning {
 #[derive(Default)]
 pub struct AddRepoView {
     pub tab: AddTab,
+    /// The first branch of a new repository (the default branch name in settings).
+    pub initial_branch: String,
     /// Clone: the URL (or a local path) to clone.
     pub url: String,
     /// Clone: where the clone goes; follows the URL until the person edits it.
@@ -113,6 +114,7 @@ impl FacetApp {
         let parent = self.default_parent();
         let view = self.add_view.get_or_insert_with(|| AddRepoView {
             tab: self.last_add_tab,
+            initial_branch: self.settings.default_branch.clone(),
             new_parent: parent.display().to_string(),
             ..AddRepoView::default()
         });
@@ -254,8 +256,9 @@ impl FacetApp {
             started: Instant::now(),
         });
         let git = self.git.clone();
+        let branch = self.settings.default_branch.clone();
         self.spawn(async move {
-            let result = facet_git::init(&git, &dest, INITIAL_BRANCH).await;
+            let result = facet_git::init(&git, &dest, &branch).await;
             Event::AddRepo(AddRepoEvent::Finished {
                 dest,
                 cloned: false,

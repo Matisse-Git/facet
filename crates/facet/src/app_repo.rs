@@ -271,6 +271,7 @@ impl FacetApp {
                 tab.refs.snapshot = snapshot;
                 tab.refs.tips = Some(current.clone());
                 tab.refs.loaded = true;
+                tab.refs.last_fetch = ready_info(tab).and_then(facet_git::RepoInfo::last_fetch);
                 self.sync_shown_stash(index);
                 let tab = &mut self.tabs[index];
                 // A filtered list stays as it is; leaving it reads the history again.
@@ -309,11 +310,12 @@ impl FacetApp {
         let git = self.git.clone();
         let tx = self.events_tx.clone();
         let ctx = self.ctx.clone();
+        let scope = self.history_scope();
         let tab = &self.tabs[index];
         self.spawn_work(tab, false, async move {
             let started = Instant::now();
             let mut builder = GraphBuilder::default();
-            let result = facet_git::stream_log(&git, &root, &cancel, FIRST_PAGE, PAGE, {
+            let result = facet_git::stream_log_in(&git, &root, scope, &cancel, FIRST_PAGE, PAGE, {
                 move |commits: Vec<LogCommit>| {
                     let rows = commits.iter().map(|commit| builder.push(commit)).collect();
                     let event = Event::Work {
@@ -473,16 +475,14 @@ impl FacetApp {
         view.cancel = None;
         match result {
             Ok((detail, files)) => {
-                // In a file's history, open that file (under its name at the time).
+                // In a file's history, open that file (under its name at the time); otherwise
+                // the commit's page lists its files and one is opened by clicking it.
                 let wanted = self.tabs[index].history.filter_path().map(str::to_owned);
-                let first = wanted
-                    .and_then(|path| files.iter().position(|file| file.path == path))
-                    .unwrap_or(0);
-                let any = !files.is_empty();
+                let open = wanted.and_then(|path| files.iter().position(|file| file.path == path));
                 let view = &mut self.tabs[index].history.commit;
                 view.body = DetailBody::Loaded { detail, files };
-                if any {
-                    self.select_commit_file(index, first);
+                if let Some(file) = open {
+                    self.select_commit_file(index, file);
                 }
             }
             Err(GitError::Cancelled) => {}
@@ -490,6 +490,30 @@ impl FacetApp {
                 view.body = DetailBody::Failed(describe_error(&error).1.unwrap_or_default());
             }
         }
+    }
+
+    /// Which commits the history lists.
+    pub(crate) fn history_scope(&self) -> facet_git::Scope {
+        if self.settings.history_all_branches {
+            facet_git::Scope::All
+        } else {
+            facet_git::Scope::Current
+        }
+    }
+
+    /// Back from a file's diff to the commit's page.
+    fn close_commit_file(&mut self, index: usize) {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        let view = &mut tab.history.commit;
+        if let Some(token) = view.diff.cancel.take() {
+            token.cancel();
+        }
+        view.diff.generation += 1;
+        view.diff.key = None;
+        view.diff.body = crate::workspace::DiffBody::None;
+        view.selected_file = None;
     }
 
     /// Show the diff of one file of the selected commit (against its first parent).
@@ -1112,6 +1136,10 @@ impl FacetApp {
                 branch: prompt.value(0),
                 path: PathBuf::from(prompt.value(1)),
             },
+            PromptKind::CommitAuthor => Action::SetCommitAuthor {
+                name: prompt.value(0),
+                email: prompt.value(1),
+            },
             PromptKind::LfsTrack => Action::CreateLfsTrack {
                 pattern: prompt.value(0),
                 lockable: prompt.checked(),
@@ -1217,6 +1245,8 @@ impl FacetApp {
                 .map(|c| (c.oid.to_string(), c.short_oid().to_string())),
             network_running: tab.network.is_some(),
             pull_mode: self.settings.pull_mode,
+            all_branches: self.settings.history_all_branches,
+            commit_file_open: tab.history.commit.selected_file.is_some(),
             forge: self.forge().map(|forge| forge.kind),
             dirty: !work.staged.is_empty() || !work.unstaged.is_empty(),
             staged: !work.staged.is_empty(),
@@ -1366,6 +1396,7 @@ impl FacetApp {
                 }
             }
             Action::SelectCommitFile(file) => self.select_commit_file(index, file),
+            Action::CloseCommitFile => self.close_commit_file(index),
             Action::ShowStash(position) => self.show_stash(index, position),
             Action::SelectStashFile(file) => self.select_stash_file(index, file),
 
@@ -1395,6 +1426,10 @@ impl FacetApp {
                         format!("Created branch {name}")
                     })))
                 });
+            }
+            Action::ShowBranches => {
+                self.settings_view = None;
+                self.open_branches = true;
             }
             Action::SwitchBranch(name) => {
                 if !self.refuse_branch_in_other_worktree(&name) {

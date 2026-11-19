@@ -24,6 +24,24 @@ impl RepoInfo {
         self.workdir.as_deref().unwrap_or(&self.git_dir)
     }
 
+    /// When anything was last fetched into this repository (the time of `FETCH_HEAD`, which
+    /// every fetch and pull writes, whichever program ran it). `None`: never fetched.
+    pub fn last_fetch(&self) -> Option<std::time::SystemTime> {
+        let modified = |dir: &Path| {
+            std::fs::metadata(dir.join("FETCH_HEAD"))
+                .and_then(|meta| meta.modified())
+                .ok()
+        };
+        // A linked worktree shares FETCH_HEAD with the main repository.
+        let common = std::fs::read_to_string(self.git_dir.join("commondir"))
+            .ok()
+            .map(|dir| self.git_dir.join(dir.trim()));
+        common
+            .as_deref()
+            .and_then(modified)
+            .or_else(|| modified(&self.git_dir))
+    }
+
     /// Short display name: the folder name of the working tree (or of the bare repo).
     pub fn name(&self) -> String {
         self.root()

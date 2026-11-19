@@ -7,13 +7,17 @@ use eframe::egui::{
     self, Align2, CornerRadius, Id, PopupCloseBehavior, Pos2, Rect, RectAlign, ScrollArea, Sense,
     Stroke, StrokeKind, Ui, Vec2,
 };
+use facet_git::parse::{GitRef, RefKind};
 use facet_git::Head;
+use std::time::SystemTime;
 
+use super::sidebar;
 use super::widgets::{self, icon_button_at, interaction_fill, list_row, text_line};
 use crate::actions::{shortcut, Action};
 use crate::app::{FacetApp, RepoTab, TabState};
 use crate::app_repo::sync_step;
 use crate::app_work::ready_info;
+use crate::format::{relative_time, unix_seconds};
 use crate::platform::{Chrome, PxRect};
 use crate::settings::same_path;
 use crate::theme::{self, icon, radius, space, Palette};
@@ -21,9 +25,8 @@ use crate::theme::{self, icon, radius, space, Palette};
 const CONTROL_HEIGHT: f32 = 32.0;
 const SEARCH_WIDTH: f32 = 400.0;
 const SWITCHER_WIDTH: f32 = 440.0;
-const BRANCH_PICKER_WIDTH: f32 = 340.0;
+const BRANCH_PICKER_WIDTH: f32 = 380.0;
 const REPO_ROW: f32 = 52.0;
-const BRANCH_ROW: f32 = 34.0;
 /// A strip of title bar that is always left empty so the window can be grabbed.
 const DRAG_STRIP: f32 = space::XL;
 
@@ -92,15 +95,7 @@ impl FacetApp {
             controls.push(sync);
             right = sync.left() - space::XS;
         }
-        if self.active_tab().is_some_and(RepoTab::is_ready) {
-            let open_in = Rect::from_min_size(
-                Pos2::new(right - CONTROL_HEIGHT, center_y - CONTROL_HEIGHT / 2.0),
-                Vec2::splat(CONTROL_HEIGHT),
-            );
-            self.open_in_menu(ui, open_in);
-            controls.push(open_in);
-            right = open_in.left() - space::XS;
-        } else if self.tabs.is_empty() {
+        if self.tabs.is_empty() {
             let gear = Rect::from_min_size(
                 Pos2::new(right - CONTROL_HEIGHT, center_y - CONTROL_HEIGHT / 2.0),
                 Vec2::splat(CONTROL_HEIGHT),
@@ -200,7 +195,7 @@ impl FacetApp {
             theme::icon_font(13.0),
             palette.text_tertiary,
         );
-        let key = widgets::shortcut_text(ui, &shortcut::PALETTE);
+        let key = widgets::shortcut_text(ui, &shortcut::PALETTE).replace('+', " ");
         let cap = widgets::key_cap(ui, Pos2::new(rect.right() - 8.0, rect.center().y), &key);
         text_line(
             ui,
@@ -253,6 +248,9 @@ impl FacetApp {
         if response.clicked() {
             ui.ctx()
                 .data_mut(|data| data.insert_temp(switcher_id().with("focus"), true));
+        }
+        if self.active_tab().is_some_and(RepoTab::is_ready) {
+            self.open_in_menu(&response);
         }
         self.repo_switcher(&response);
         rect
@@ -506,7 +504,7 @@ impl FacetApp {
                 CONTROL_HEIGHT,
             ),
         );
-        let open = egui::Popup::is_id_open(ui.ctx(), branch_picker_id());
+        let open = egui::Popup::is_id_open(ui.ctx(), branch_picker_id().with("popup"));
         let response = ghost(ui, rect, branch_picker_id(), open);
         ui.painter().text(
             Pos2::new(rect.left() + 16.0, center_y),
@@ -530,6 +528,11 @@ impl FacetApp {
         } else {
             response.on_hover_text("Switch branch")
         };
+        if std::mem::take(&mut self.open_branches) && !open {
+            egui::Popup::open_id(ui.ctx(), egui::Popup::default_response_id(&response));
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(branch_picker_id().with("focus"), true));
+        }
         if response.clicked() {
             ui.ctx()
                 .data_mut(|data| data.insert_temp(branch_picker_id().with("focus"), true));
@@ -538,44 +541,80 @@ impl FacetApp {
         Some(rect)
     }
 
-    /// The flyout under the branch button: local branches, find, and "New branch…".
+    /// The flyout under the branch button: "Find or create a branch", the current branch, the
+    /// other branches by when they last moved, the remote branches, and New branch / Merge
+    /// into this.
+    #[allow(clippy::too_many_lines)]
     fn branch_picker(&mut self, button: &egui::Response) {
         let Some(tab) = self.active_tab() else {
             return;
         };
-        let mut branches: Vec<(String, bool)> = tab
-            .refs
-            .snapshot
-            .local()
-            .map(|branch| (branch.name.clone(), branch.head))
+        let forge = self.forge().map(|forge| forge.kind);
+        let snapshot = &tab.refs.snapshot;
+        let mut locals: Vec<&GitRef> = snapshot.local().collect();
+        locals.sort_by_key(|branch| std::cmp::Reverse(branch.date));
+        let current = locals
+            .iter()
+            .position(|branch| branch.head)
+            .map(|index| locals.remove(index));
+        let remotes: Vec<&GitRef> = snapshot
+            .remotes
+            .iter()
+            .flat_map(|remote| snapshot.remote_branches(&remote.name))
+            .filter(|branch| branch.short_name() != "HEAD")
             .collect();
-        branches.sort_by_key(|(_, head)| !*head);
+        let remote_label = match snapshot.remotes.as_slice() {
+            [only] => format!("{} · {}", only.name, remotes.len()),
+            _ => remotes.len().to_string(),
+        };
+        let default = ["main", "master", "trunk"]
+            .into_iter()
+            .find(|name| snapshot.local().any(|branch| branch.name == *name));
+        let info = &tab.work.branch;
+        let status = match (&info.upstream, info.ahead.unwrap_or(0), info.behind.unwrap_or(0)) {
+            (None, ..) => "Not published yet".to_owned(),
+            (Some(upstream), 0, 0) => format!("Up to date with {upstream}"),
+            (Some(upstream), ahead, 0) => format!("{ahead} ahead of {}", remote_of(upstream)),
+            (Some(upstream), 0, behind) => format!("{behind} behind {}", remote_of(upstream)),
+            (Some(upstream), ahead, behind) => {
+                format!("{ahead} ahead, {behind} behind {}", remote_of(upstream))
+            }
+        };
+        let now = unix_seconds(SystemTime::now());
         let mut chosen = None;
         let mut close = false;
+        let frame = egui::Frame::popup(&button.ctx.style_of(button.ctx.theme()))
+            .inner_margin(0)
+            .corner_radius(radius::L);
         egui::Popup::menu(button)
             .id(egui::Popup::default_response_id(button))
             .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
             .align(RectAlign::BOTTOM_START)
             .gap(space::XS)
             .width(BRANCH_PICKER_WIDTH)
+            .frame(frame)
             .show(|ui| {
                 let palette = Palette::of(ui.ctx());
                 ui.spacing_mut().item_spacing.y = 0.0;
                 ui.set_width(BRANCH_PICKER_WIDTH);
+                let block = |ui: &mut Ui, height: f32| {
+                    ui.allocate_exact_size(Vec2::new(BRANCH_PICKER_WIDTH, height), Sense::hover())
+                        .0
+                };
+
+                // Find or create.
                 let query_id = branch_picker_id().with("query");
                 let mut query: String = ui
                     .ctx()
                     .data_mut(|data| data.get_temp::<String>(query_id).unwrap_or_default());
-                let (field, _) = ui.allocate_exact_size(
-                    Vec2::new(BRANCH_PICKER_WIDTH, CONTROL_HEIGHT),
-                    Sense::hover(),
-                );
-                let response = widgets::text_field(
+                let field = block(ui, 56.0).shrink(10.0);
+                let response = widgets::search_field(
                     ui,
-                    field.shrink2(Vec2::new(space::XS, 0.0)),
+                    field,
                     query_id.with("field"),
                     &mut query,
-                    "Find a branch",
+                    "Find or create a branch",
+                    space::S,
                 );
                 if ui.ctx().data_mut(|data| {
                     data.remove_temp::<bool>(branch_picker_id().with("focus"))
@@ -586,104 +625,304 @@ impl FacetApp {
                 ui.ctx()
                     .data_mut(|data| data.insert_temp(query_id, query.clone()));
                 let needle = query.trim().to_lowercase();
-                ui.add_space(space::XS);
+                let matches = |name: &str| needle.is_empty() || name.to_lowercase().contains(&needle);
+                let new_name: String = query
+                    .trim()
+                    .chars()
+                    .map(|c| if c.is_whitespace() { '-' } else { c })
+                    .collect();
+                let exists = snapshot.local().any(|branch| branch.name == new_name);
+                let remotes_id = branch_picker_id().with("remotes");
+                let remotes_open = !needle.is_empty()
+                    || ui
+                        .ctx()
+                        .data(|data| data.get_temp::<bool>(remotes_id).unwrap_or(false));
                 let mut first_match = None;
+
+                let label = |ui: &mut Ui, text: &str, top: f32| {
+                    let rect = block(ui, top + 20.0);
+                    ui.painter().text(
+                        Pos2::new(rect.left() + 16.0, rect.bottom() - 10.0),
+                        Align2::LEFT_CENTER,
+                        text,
+                        theme::small_strong(),
+                        palette.text_tertiary,
+                    );
+                };
                 ScrollArea::vertical()
                     .id_salt("branch-picker-scroll")
-                    .max_height(BRANCH_ROW * 10.0)
+                    .max_height(400.0)
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
                         let mut any = false;
-                        for (name, head) in &branches {
-                            if !needle.is_empty() && !name.to_lowercase().contains(&needle) {
-                                continue;
-                            }
+
+                        // "Create branch x" while what is typed is not a branch yet.
+                        if !new_name.is_empty() && !exists {
                             any = true;
-                            let (rect, _) = ui.allocate_exact_size(
-                                Vec2::new(BRANCH_PICKER_WIDTH, BRANCH_ROW),
-                                Sense::hover(),
-                            );
-                            let row = rect.shrink2(Vec2::new(space::XS, 1.0));
+                            let row = block(ui, 44.0).shrink2(Vec2::new(6.0, 2.0));
                             let response =
-                                list_row(ui, row, Id::unique(("pick-branch", name)), *head);
-                            if *head {
-                                ui.painter().text(
-                                    Pos2::new(row.left() + 16.0, row.center().y),
-                                    Align2::CENTER_CENTER,
-                                    icon::CHECK,
-                                    theme::icon_font(12.0),
-                                    palette.accent,
-                                );
-                            }
+                                list_row(ui, row, Id::unique("pick-branch-create"), false);
+                            ui.painter().text(
+                                Pos2::new(row.left() + 18.0, row.center().y),
+                                Align2::CENTER_CENTER,
+                                icon::ADD,
+                                theme::icon_font(13.0),
+                                palette.accent,
+                            );
                             text_line(
                                 ui,
-                                Pos2::new(row.left() + 32.0, row.center().y),
-                                name,
-                                if *head {
-                                    theme::strong()
-                                } else {
-                                    theme::body()
-                                },
+                                Pos2::new(row.left() + 36.0, row.center().y),
+                                &format!("Create branch “{new_name}”"),
+                                theme::body(),
                                 palette.text,
-                                row.width() - 40.0,
+                                row.width() - 46.0,
                             );
-                            if !*head {
-                                first_match
-                                    .get_or_insert_with(|| Action::SwitchBranch(name.clone()));
-                            }
+                            let create = Action::CreateBranch {
+                                name: new_name.clone(),
+                                at: "HEAD".to_owned(),
+                                switch: true,
+                            };
                             if response.clicked() {
-                                if *head {
-                                    close = true;
-                                } else {
-                                    chosen = Some(Action::SwitchBranch(name.clone()));
+                                chosen = Some(create.clone());
+                            }
+                            first_match.get_or_insert(create);
+                        }
+
+                        if let Some(branch) = current.filter(|branch| matches(&branch.name)) {
+                            any = true;
+                            label(ui, "Current", 4.0);
+                            let row = block(ui, 46.0).shrink2(Vec2::new(6.0, 1.0));
+                            let response =
+                                list_row(ui, row, Id::unique("pick-branch-current"), true);
+                            ui.painter().text(
+                                Pos2::new(row.left() + 18.0, row.center().y),
+                                Align2::CENTER_CENTER,
+                                icon::CHECK,
+                                theme::icon_font(12.0),
+                                palette.accent,
+                            );
+                            two_lines(
+                                ui,
+                                row,
+                                &branch.name,
+                                theme::strong(),
+                                palette.text,
+                                &status,
+                                "",
+                            );
+                            if response.clicked() {
+                                close = true;
+                            }
+                            let mut menu = Vec::new();
+                            response.context_menu(|ui| {
+                                sidebar::branch_menu(ui, branch, forge, &mut menu);
+                            });
+                            if let Some(action) = menu.pop() {
+                                chosen = Some(action);
+                            }
+                        }
+
+                        let others: Vec<&&GitRef> =
+                            locals.iter().filter(|branch| matches(&branch.name)).collect();
+                        if !others.is_empty() {
+                            any = true;
+                            label(ui, if needle.is_empty() { "Recent" } else { "Branches" }, 10.0);
+                        }
+                        for branch in others {
+                            let row = block(ui, 46.0).shrink2(Vec2::new(6.0, 1.0));
+                            let response =
+                                list_row(ui, row, Id::unique(("pick-branch", &branch.name)), false);
+                            let when = relative_time(now, branch.date);
+                            let detail = if branch.author.is_empty() {
+                                when
+                            } else {
+                                format!("{} · {when}", branch.author)
+                            };
+                            let tag = if Some(branch.name.as_str()) == default {
+                                "default"
+                            } else {
+                                ""
+                            };
+                            two_lines(
+                                ui,
+                                row,
+                                &branch.name,
+                                theme::body(),
+                                palette.text,
+                                &detail,
+                                tag,
+                            );
+                            let switch = Action::SwitchBranch(branch.name.clone());
+                            if response.clicked() {
+                                chosen = Some(switch.clone());
+                            }
+                            first_match.get_or_insert(switch);
+                            let mut menu = Vec::new();
+                            response.context_menu(|ui| {
+                                sidebar::branch_menu(ui, branch, forge, &mut menu);
+                            });
+                            if let Some(action) = menu.pop() {
+                                chosen = Some(action);
+                            }
+                        }
+
+                        // Remote branches: one row that opens the list (always open while
+                        // finding).
+                        let shown: Vec<&&GitRef> = remotes
+                            .iter()
+                            .filter(|branch| matches(&branch.name))
+                            .collect();
+                        if !remotes.is_empty() && (needle.is_empty() || !shown.is_empty()) {
+                            any = true;
+                            ui.add_space(6.0);
+                            let row = block(ui, 40.0).shrink2(Vec2::new(6.0, 0.0));
+                            let response =
+                                list_row(ui, row, Id::unique("pick-branch-remotes"), false);
+                            ui.painter().text(
+                                Pos2::new(row.left() + 18.0, row.center().y),
+                                Align2::CENTER_CENTER,
+                                icon::CLOUD,
+                                theme::icon_font(14.0),
+                                palette.text_secondary,
+                            );
+                            ui.painter().text(
+                                Pos2::new(row.left() + 36.0, row.center().y),
+                                Align2::LEFT_CENTER,
+                                "Remote branches",
+                                theme::body(),
+                                palette.text_secondary,
+                            );
+                            ui.painter().text(
+                                Pos2::new(row.right() - 10.0, row.center().y),
+                                Align2::RIGHT_CENTER,
+                                &remote_label,
+                                theme::small(),
+                                palette.text_tertiary,
+                            );
+                            if response.clicked() && needle.is_empty() {
+                                ui.ctx()
+                                    .data_mut(|data| data.insert_temp(remotes_id, !remotes_open));
+                            }
+                            if remotes_open {
+                                for branch in shown {
+                                    let row = block(ui, 36.0).shrink2(Vec2::new(6.0, 1.0));
+                                    let response = list_row(
+                                        ui,
+                                        row,
+                                        Id::unique(("pick-remote-branch", &branch.name)),
+                                        false,
+                                    );
+                                    let remote = match &branch.kind {
+                                        RefKind::Remote { remote } => remote.as_str(),
+                                        _ => "",
+                                    };
+                                    let right = ui
+                                        .painter()
+                                        .text(
+                                            Pos2::new(row.right() - 10.0, row.center().y),
+                                            Align2::RIGHT_CENTER,
+                                            remote,
+                                            theme::small(),
+                                            palette.text_tertiary,
+                                        )
+                                        .left();
+                                    text_line(
+                                        ui,
+                                        Pos2::new(row.left() + 36.0, row.center().y),
+                                        branch.short_name(),
+                                        theme::body(),
+                                        palette.text,
+                                        right - row.left() - 36.0 - space::S,
+                                    );
+                                    let checkout = Action::CheckoutRemoteBranch(branch.name.clone());
+                                    if response.clicked() {
+                                        chosen = Some(checkout.clone());
+                                    }
+                                    first_match.get_or_insert(checkout);
+                                    let response = response.on_hover_text(format!(
+                                        "Check out {} as a local branch",
+                                        branch.name
+                                    ));
+                                    let mut menu = Vec::new();
+                                    response.context_menu(|ui| {
+                                        sidebar::remote_branch_menu(ui, branch, forge, &mut menu);
+                                    });
+                                    if let Some(action) = menu.pop() {
+                                        chosen = Some(action);
+                                    }
                                 }
                             }
                         }
                         if !any {
-                            let (rect, _) = ui.allocate_exact_size(
-                                Vec2::new(BRANCH_PICKER_WIDTH, BRANCH_ROW),
-                                Sense::hover(),
-                            );
+                            let rect = block(ui, 44.0);
                             ui.painter().text(
-                                Pos2::new(rect.left() + space::M, rect.center().y),
+                                Pos2::new(rect.left() + 16.0, rect.center().y),
                                 Align2::LEFT_CENTER,
                                 "No branch matches",
                                 theme::body(),
                                 palette.text_tertiary,
                             );
                         }
+                        ui.add_space(6.0);
                     });
                 if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
                     chosen = chosen.take().or(first_match);
                 }
-                ui.add_space(space::XS);
-                let (line, _) =
-                    ui.allocate_exact_size(Vec2::new(BRANCH_PICKER_WIDTH, 1.0), Sense::hover());
-                widgets::hairline_h(ui, line.x_range().into(), line.center().y);
-                ui.add_space(space::XS);
-                let (rect, _) =
-                    ui.allocate_exact_size(Vec2::new(BRANCH_PICKER_WIDTH, 38.0), Sense::hover());
-                let row = rect.shrink2(Vec2::new(space::XS, 2.0));
-                let response = list_row(ui, row, Id::unique("pick-branch-new"), false);
-                ui.painter().text(
-                    Pos2::new(row.left() + 16.0, row.center().y),
-                    Align2::CENTER_CENTER,
-                    icon::ADD,
-                    theme::icon_font(12.0),
-                    palette.accent,
+
+                // New branch / Merge into this.
+                let footer = block(ui, 55.0);
+                ui.painter()
+                    .rect_filled(footer, CornerRadius {
+                        nw: 0,
+                        ne: 0,
+                        sw: radius::L,
+                        se: radius::L,
+                    }, palette.surface_alt);
+                ui.painter()
+                    .hline(footer.x_range(), footer.top() + 0.5, palette.hairline_stroke());
+                let inner = Rect::from_min_max(
+                    Pos2::new(footer.left() + 10.0, footer.top() + 11.0),
+                    Pos2::new(footer.right() - 10.0, footer.bottom() - 10.0),
                 );
-                ui.painter().text(
-                    Pos2::new(row.left() + 32.0, row.center().y),
-                    Align2::LEFT_CENTER,
-                    "New branch…",
-                    theme::body(),
-                    palette.text,
+                let half = (inner.width() - space::S) / 2.0;
+                let new = Rect::from_min_size(inner.min, Vec2::new(half, inner.height()));
+                let merge = Rect::from_min_size(
+                    Pos2::new(new.right() + space::S, inner.top()),
+                    Vec2::new(half, inner.height()),
                 );
                 let key = widgets::shortcut_text(ui, &shortcut::NEW_BRANCH);
-                widgets::key_cap(ui, Pos2::new(row.right() - space::S, row.center().y), &key);
-                if response.clicked() {
+                if widgets::primary_button_at(
+                    ui,
+                    new,
+                    Id::unique("pick-branch-new"),
+                    Some(icon::ADD),
+                    "New branch",
+                    true,
+                )
+                .on_hover_text(format!("Start a new branch here  ({key})"))
+                .clicked()
+                {
                     chosen = Some(Action::NewBranch { at: None });
                 }
+                let merge_response = widgets::outline_button_at(
+                    ui,
+                    merge,
+                    Id::unique("pick-branch-merge"),
+                    Some(icon::BRANCH),
+                    "Merge into this…",
+                    "Merge another branch into the current one",
+                );
+                let merge_popup = egui::Popup::menu(&merge_response)
+                    .close_behavior(PopupCloseBehavior::CloseOnClickOutside);
+                merge_popup.show(|ui| {
+                    ui.set_min_width(220.0);
+                    for branch in locals.iter().chain(remotes.iter()) {
+                        if ui.button(&branch.name).clicked() {
+                            chosen = Some(Action::MergeIntoCurrent(branch.name.clone()));
+                            ui.close();
+                        }
+                    }
+                });
                 if chosen.is_some() || close {
                     ui.ctx().data_mut(|data| data.remove::<String>(query_id));
                     ui.close();
@@ -891,6 +1130,48 @@ fn repo_row_text(
     }
 }
 
+/// `origin` of `origin/main`.
+fn remote_of(upstream: &str) -> &str {
+    upstream.split('/').next().unwrap_or(upstream)
+}
+
+/// A flyout row's name over its detail (from 36 px in), and an optional note on the right.
+fn two_lines(
+    ui: &Ui,
+    row: Rect,
+    name: &str,
+    font: egui::FontId,
+    color: egui::Color32,
+    detail: &str,
+    note: &str,
+) {
+    let palette = Palette::of(ui.ctx());
+    let mut right = row.right() - 10.0;
+    if !note.is_empty() {
+        right = ui
+            .painter()
+            .text(
+                Pos2::new(right, row.center().y),
+                Align2::RIGHT_CENTER,
+                note,
+                theme::caption(),
+                palette.text_tertiary,
+            )
+            .left()
+            - space::S;
+    }
+    let left = row.left() + 36.0;
+    text_line(ui, Pos2::new(left, row.center().y - 8.0), name, font, color, right - left);
+    text_line(
+        ui,
+        Pos2::new(left, row.center().y + 9.0),
+        detail,
+        theme::small(),
+        palette.text_tertiary,
+        right - left,
+    );
+}
+
 /// A repository's display name: its folder name.
 fn repo_name(path: &std::path::Path) -> String {
     path.file_name().map_or_else(
@@ -900,24 +1181,18 @@ fn repo_name(path: &std::path::Path) -> String {
 }
 
 impl FacetApp {
-    /// The "open in" button and its menu: File Explorer plus the programs found installed.
-    fn open_in_menu(&mut self, ui: &mut Ui, rect: Rect) {
-        let response = icon_button_at(
-            ui,
-            rect,
-            Id::unique("title-open-in"),
-            icon::OPEN_IN,
-            "Open the repository in another program",
-        );
+    /// The repository button's context menu: open the repository in File Explorer or one of
+    /// the programs found installed (also in the palette).
+    fn open_in_menu(&mut self, response: &egui::Response) {
         let targets = self.installed.open_targets();
         let mut chosen = None;
-        egui::Popup::menu(&response).show(|ui| {
-            let explorer = widgets::tooltip_with_shortcut(ui, "File Explorer", &shortcut::REVEAL);
+        response.context_menu(|ui| {
+            let explorer = widgets::tooltip_with_shortcut(ui, "Show in Explorer", &shortcut::REVEAL);
             if ui.button(explorer).clicked() {
                 chosen = Some(Action::RevealInExplorer);
             }
             for target in targets {
-                if ui.button(target.label()).clicked() {
+                if ui.button(format!("Open in {}", target.label())).clicked() {
                     chosen = Some(Action::OpenIn(target));
                 }
             }

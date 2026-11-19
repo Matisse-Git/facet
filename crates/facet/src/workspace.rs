@@ -18,11 +18,16 @@ pub enum Area {
     Unstaged,
 }
 
-/// One row of the combined file list (section header or file).
+/// One row of the file list: a file, in the list its diff comes from. Every changed file has
+/// exactly one row; its checkbox says whether it is staged.
+pub type Row = (Area, usize);
+
+/// Whether a file's changes are in the index: all, some (partly staged) or none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Row {
-    Header(Area),
-    File(Area, usize),
+pub enum Included {
+    All,
+    Some,
+    None,
 }
 
 /// The selected files. A selection lives in one area at a time; `cursor` is the row the
@@ -108,6 +113,52 @@ pub struct TextDiff {
     pub widest: usize,
     /// Hunks and lines can be staged / unstaged / discarded individually.
     pub partial: bool,
+    /// Side-by-side rows: the old and the new line (indices into `diff.lines`, [`NO_LINE`]
+    /// for a blank side).
+    pub pairs: Vec<[u32; 2]>,
+    /// Where each hunk's rows start in `pairs`.
+    pub pair_starts: Vec<u32>,
+}
+
+/// A blank side of a side-by-side row.
+pub const NO_LINE: u32 = u32::MAX;
+
+/// Line up a diff's lines side by side: context on both sides, each run of removed lines
+/// next to the added lines that replace it.
+fn pair_lines(diff: &FileDiff) -> (Vec<[u32; 2]>, Vec<u32>) {
+    let mut pairs = Vec::with_capacity(diff.lines.len());
+    let mut starts = Vec::with_capacity(diff.hunks.len());
+    let flush = |pairs: &mut Vec<[u32; 2]>, removed: &mut Vec<u32>, added: &mut Vec<u32>| {
+        for row in 0..removed.len().max(added.len()) {
+            pairs.push([
+                removed.get(row).copied().unwrap_or(NO_LINE),
+                added.get(row).copied().unwrap_or(NO_LINE),
+            ]);
+        }
+        removed.clear();
+        added.clear();
+    };
+    let (mut removed, mut added) = (Vec::new(), Vec::new());
+    for hunk in &diff.hunks {
+        starts.push(pairs.len() as u32);
+        for index in hunk.lines.clone() {
+            match diff.lines[index as usize].kind {
+                LineKind::Context => {
+                    flush(&mut pairs, &mut removed, &mut added);
+                    pairs.push([index, index]);
+                }
+                LineKind::Removed => {
+                    if !added.is_empty() {
+                        flush(&mut pairs, &mut removed, &mut added);
+                    }
+                    removed.push(index);
+                }
+                LineKind::Added => added.push(index),
+            }
+        }
+        flush(&mut pairs, &mut removed, &mut added);
+    }
+    (pairs, starts)
 }
 
 impl TextDiff {
@@ -119,6 +170,7 @@ impl TextDiff {
             .max()
             .unwrap_or(0)
             .min(crate::highlight::MAX_LINE_BYTES + 1);
+        let (pairs, pair_starts) = pair_lines(&diff);
         Self {
             diff,
             decorations: None,
@@ -126,35 +178,14 @@ impl TextDiff {
             drag: None,
             widest,
             partial,
+            pairs,
+            pair_starts,
         }
     }
 
     /// Rows of the diff view: one per hunk header plus one per line.
     pub fn row_count(&self) -> usize {
         self.diff.hunks.len() + self.diff.lines.len()
-    }
-
-    /// What row `row` shows.
-    pub fn row(&self, row: usize) -> DiffRow {
-        // Hunk `h` has its header at row `lines.start + h`: find the last header at or
-        // before `row`.
-        let hunks = &self.diff.hunks;
-        let header_row = |hunk: usize| hunks[hunk].lines.start as usize + hunk;
-        let (mut low, mut high) = (0, hunks.len());
-        while low < high {
-            let mid = (low + high) / 2;
-            if header_row(mid) <= row {
-                low = mid + 1;
-            } else {
-                high = mid;
-            }
-        }
-        let hunk = low.saturating_sub(1);
-        if row == header_row(hunk) {
-            DiffRow::Hunk(hunk)
-        } else {
-            DiffRow::Line(row - hunk - 1)
-        }
     }
 
     pub fn is_changed_line(&self, line: usize) -> bool {
@@ -179,12 +210,6 @@ impl TextDiff {
         }
         self.selected = selected;
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DiffRow {
-    Hunk(usize),
-    Line(usize),
 }
 
 pub enum DiffBody {
@@ -288,6 +313,10 @@ pub struct Workspace {
     /// Indices into `entries`.
     pub staged: Vec<u32>,
     pub unstaged: Vec<u32>,
+    /// The file list's rows: conflicts first, then by path.
+    rows: Vec<Row>,
+    /// Lines added / removed per path, `HEAD` to working tree.
+    pub counts: HashMap<String, (u32, u32)>,
     pub selection: Selection,
     /// Scroll the file list to the cursor on the next frame.
     pub reveal_cursor: bool,
@@ -317,28 +346,35 @@ impl Workspace {
             .map(|entry| &self.entries[*entry as usize])
     }
 
-    /// Rows of the combined list: `Staged` header, staged files, `Changes` header, files.
+    /// Rows of the file list, one per changed file.
     pub fn row_count(&self) -> usize {
-        2 + self.staged.len() + self.unstaged.len()
+        self.rows.len()
     }
 
     pub fn row(&self, row: usize) -> Row {
-        let staged = self.staged.len();
-        if row == 0 {
-            Row::Header(Area::Staged)
-        } else if row <= staged {
-            Row::File(Area::Staged, row - 1)
-        } else if row == staged + 1 {
-            Row::Header(Area::Unstaged)
-        } else {
-            Row::File(Area::Unstaged, row - staged - 2)
-        }
+        self.rows[row]
     }
 
-    pub fn row_of(&self, area: Area, index: usize) -> usize {
-        match area {
-            Area::Staged => 1 + index,
-            Area::Unstaged => 2 + self.staged.len() + index,
+    /// The row showing this file (`None`: a partly staged file's staged side, which has no
+    /// row of its own).
+    pub fn row_of(&self, area: Area, index: usize) -> Option<usize> {
+        self.rows.iter().position(|row| *row == (area, index))
+    }
+
+    /// Files with staged changes, of all changed files.
+    pub fn included_count(&self) -> (usize, usize) {
+        (self.staged.len(), self.rows.len())
+    }
+
+    /// How much of the file in this row is staged.
+    pub fn included(&self, area: Area, index: usize) -> Included {
+        let Some(entry) = self.entry(area, index) else {
+            return Included::None;
+        };
+        match (entry.is_staged(), entry.is_unstaged()) {
+            (true, false) => Included::All,
+            (true, true) => Included::Some,
+            _ => Included::None,
         }
     }
 
@@ -374,6 +410,33 @@ impl Workspace {
             let (a, b) = (&entries[*a as usize], &entries[*b as usize]);
             (a.kind != EntryKind::Unmerged, &a.path).cmp(&(b.kind != EntryKind::Unmerged, &b.path))
         });
+        // One row per file: its unstaged side when it has one, else its staged side.
+        let staged_at: HashMap<u32, usize> = self
+            .staged
+            .iter()
+            .enumerate()
+            .map(|(position, entry)| (*entry, position))
+            .collect();
+        let unstaged_at: HashMap<u32, usize> = self
+            .unstaged
+            .iter()
+            .enumerate()
+            .map(|(position, entry)| (*entry, position))
+            .collect();
+        let mut order: Vec<u32> = (0..self.entries.len() as u32).collect();
+        order.sort_by(|a, b| {
+            let (a, b) = (&entries[*a as usize], &entries[*b as usize]);
+            (a.kind != EntryKind::Unmerged, &a.path).cmp(&(b.kind != EntryKind::Unmerged, &b.path))
+        });
+        self.rows = order
+            .into_iter()
+            .filter_map(|entry| {
+                unstaged_at
+                    .get(&entry)
+                    .map(|position| (Area::Unstaged, *position))
+                    .or_else(|| staged_at.get(&entry).map(|position| (Area::Staged, *position)))
+            })
+            .collect();
         self.loaded = true;
 
         // Re-find the selected files.
@@ -399,14 +462,29 @@ impl Workspace {
             selection.cursor = find(&cursor_path);
             selection.anchor = find(&anchor_path);
         }
-        // The file under the cursor left this list (it was staged, committed, discarded…):
-        // stay at the same position so the next file is ready, else move to the other list.
+        // The file under the cursor was staged or unstaged: its row now shows the other list,
+        // so follow it there.
+        let other = match area {
+            Area::Staged => Area::Unstaged,
+            Area::Unstaged => Area::Staged,
+        };
+        if selection.cursor.is_none() && cursor_path.is_some() {
+            let moved = self.list(other).iter().position(|entry| {
+                Some(&self.entries[*entry as usize].path) == cursor_path.as_ref()
+            });
+            if let Some(index) = moved.filter(|index| self.row_of(other, *index).is_some()) {
+                selection = Selection {
+                    area: other,
+                    items: BTreeSet::from([index]),
+                    anchor: Some(index),
+                    cursor: Some(index),
+                };
+            }
+        }
+        // The file under the cursor is gone (committed, discarded…): stay at the same
+        // position so the next file is ready, else move to the other list.
         if selection.cursor.is_none() && old_cursor.is_some() {
             let len = self.list(area).len();
-            let other = match area {
-                Area::Staged => Area::Unstaged,
-                Area::Unstaged => Area::Staged,
-            };
             if len > 0 {
                 selection.cursor = Some(old_cursor.unwrap_or(0).min(len - 1));
             } else if !self.list(other).is_empty() {
@@ -488,12 +566,9 @@ impl Workspace {
         selection.cursor = Some(index);
     }
 
-    /// Move the cursor up or down through both lists (keyboard navigation).
+    /// Move the cursor up or down the file list (keyboard navigation).
     pub fn move_cursor(&mut self, step: isize, extend: bool) {
-        let files: Vec<(Area, usize)> = (0..self.staged.len())
-            .map(|index| (Area::Staged, index))
-            .chain((0..self.unstaged.len()).map(|index| (Area::Unstaged, index)))
-            .collect();
+        let files = self.rows.clone();
         if files.is_empty() {
             return;
         }
@@ -607,13 +682,19 @@ mod tests {
             paths(&workspace, Area::Unstaged),
             ["m-conflict.txt", "a-new.txt", "both.txt", "z.txt"]
         );
-        assert_eq!(workspace.row_count(), 8);
-        assert_eq!(workspace.row(0), Row::Header(Area::Staged));
-        assert_eq!(workspace.row(2), Row::File(Area::Staged, 1));
-        assert_eq!(workspace.row(3), Row::Header(Area::Unstaged));
-        assert_eq!(workspace.row(7), Row::File(Area::Unstaged, 3));
-        assert_eq!(workspace.row_of(Area::Unstaged, 3), 7);
-        assert_eq!(workspace.row_of(Area::Staged, 0), 1);
+        // One row per file, conflicts first; a partly staged file shows its unstaged side.
+        assert_eq!(workspace.row_count(), 5);
+        assert_eq!(workspace.row(0), (Area::Unstaged, 0));
+        assert_eq!(workspace.row(1), (Area::Unstaged, 1));
+        assert_eq!(workspace.row(2), (Area::Unstaged, 2));
+        assert_eq!(workspace.row(3), (Area::Staged, 1));
+        assert_eq!(workspace.row(4), (Area::Unstaged, 3));
+        assert_eq!(workspace.row_of(Area::Staged, 0), None);
+        assert_eq!(workspace.row_of(Area::Unstaged, 3), Some(4));
+        assert_eq!(workspace.included_count(), (2, 5));
+        assert_eq!(workspace.included(Area::Unstaged, 2), Included::Some);
+        assert_eq!(workspace.included(Area::Staged, 1), Included::All);
+        assert_eq!(workspace.included(Area::Unstaged, 3), Included::None);
     }
 
     #[test]
@@ -638,8 +719,8 @@ mod tests {
     #[test]
     fn the_cursor_walks_through_both_lists() {
         let mut w = workspace(vec![
-            staged("s1"),
-            staged("s2"),
+            staged("a1"),
+            staged("a2"),
             unstaged("u1"),
             unstaged("u2"),
         ]);
@@ -687,28 +768,35 @@ mod tests {
     }
 
     #[test]
-    fn staging_the_current_file_moves_on_to_the_next() {
+    fn staging_the_current_file_keeps_it_selected() {
         let mut w = workspace(vec![unstaged("a"), unstaged("b"), unstaged("c")]);
         w.click(Area::Unstaged, 1, false, false);
-        // `b` was staged.
+        // `b` was staged: its row stays where it was, now checked.
         w.apply_status(Status {
             branch: BranchInfo::default(),
             entries: vec![unstaged("a"), staged("b"), unstaged("c")],
         });
-        assert_eq!(w.selection.area, Area::Unstaged);
-        assert_eq!(w.current().unwrap().1.path, "c");
-        assert_eq!(w.selection.items, BTreeSet::from([1]));
-
-        // Staging the last one keeps the cursor on the new last row…
+        assert_eq!(w.selection.area, Area::Staged);
+        assert_eq!(w.current().unwrap().1.path, "b");
+        assert_eq!(w.row_of(Area::Staged, 0), Some(1));
+        // Unstaged again.
         w.apply_status(Status {
             branch: BranchInfo::default(),
-            entries: vec![unstaged("a"), staged("b"), staged("c")],
+            entries: vec![unstaged("a"), unstaged("b"), unstaged("c")],
         });
-        assert_eq!(w.current().unwrap().1.path, "a");
+        assert_eq!(w.selection.area, Area::Unstaged);
+        assert_eq!(w.current().unwrap().1.path, "b");
+
+        // A committed or discarded file: the cursor stays on the same position…
+        w.apply_status(Status {
+            branch: BranchInfo::default(),
+            entries: vec![unstaged("a"), unstaged("c")],
+        });
+        assert_eq!(w.current().unwrap().1.path, "c");
         // …and when the list empties, the selection moves to the other list.
         w.apply_status(Status {
             branch: BranchInfo::default(),
-            entries: vec![staged("a"), staged("b"), staged("c")],
+            entries: vec![staged("a"), staged("x")],
         });
         assert_eq!(w.selection.area, Area::Staged);
         assert_eq!(w.current().unwrap().1.path, "a");
@@ -750,7 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn diff_rows_and_line_painting() {
+    fn diff_pairs_and_line_painting() {
         let diff = facet_git::parse::parse_file_diff(
             b"2\t2\tf\0\0diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n a\n-b\n+B\n@@ -9,2 +9,2 @@\n-x\n+X\n y\n"
                 .to_vec(),
@@ -758,20 +846,9 @@ mod tests {
         .unwrap();
         let mut text = TextDiff::new(Arc::new(diff), true);
         assert_eq!(text.row_count(), 8);
-        let rows: Vec<DiffRow> = (0..8).map(|row| text.row(row)).collect();
-        assert_eq!(
-            rows,
-            [
-                DiffRow::Hunk(0),
-                DiffRow::Line(0),
-                DiffRow::Line(1),
-                DiffRow::Line(2),
-                DiffRow::Hunk(1),
-                DiffRow::Line(3),
-                DiffRow::Line(4),
-                DiffRow::Line(5),
-            ]
-        );
+        // Side by side: context on both sides, a removed line next to the line replacing it.
+        assert_eq!(text.pairs, vec![[0, 0], [1, 2], [3, 4], [5, 5]]);
+        assert_eq!(text.pair_starts, vec![0, 2]);
         // Painting over a range only picks changed lines.
         text.paint_selection(0, 4, true, &BTreeSet::new());
         assert_eq!(text.selected, BTreeSet::from([1, 2, 3, 4]));
