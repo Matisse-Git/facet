@@ -78,7 +78,9 @@ pub use remote::{
 pub use repo::{commit_summary, discover, head, version, Head, RepoInfo};
 pub use runner::{Git, GitCommand, GitOutput, ProgressFn};
 pub use stage::{apply_patch, stage_all, stage_paths, unstage_all, unstage_paths, ApplyTo};
-pub use stash::{restore_stash, stash_apply, stash_drop, stash_push, StashOptions};
+pub use stash::{
+    restore_stash, stash_apply, stash_drop, stash_files, stash_push, StashFile, StashOptions,
+};
 pub use status::{perf_config, set_perf_config, status, PerfConfig};
 pub use submodule::{submodule_range, submodules, sync_submodules, update_submodules};
 pub use tokio_util::sync::CancellationToken;

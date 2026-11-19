@@ -656,6 +656,15 @@ impl FacetApp {
                     _ => None,
                 }
             }
+            View::Stash => {
+                let key = tab.stash.diff.key.as_ref()?;
+                match &key.request.source {
+                    facet_git::DiffSource::Commit { new, .. } => {
+                        Some((key.request.path.clone(), Some(new.clone())))
+                    }
+                    _ => None,
+                }
+            }
         }
     }
 
@@ -686,6 +695,16 @@ impl FacetApp {
                 let view = &tab.history.commit;
                 let key = view.diff.key.as_ref()?;
                 let file = view.files().get(view.selected_file?)?;
+                Some((
+                    key.request.clone(),
+                    file.old_oid.clone(),
+                    file.new_oid.clone(),
+                ))
+            }
+            View::Stash => {
+                let view = &tab.stash;
+                let key = view.diff.key.as_ref()?;
+                let file = &view.files().get(view.selected_file?)?.file;
                 Some((
                     key.request.clone(),
                     file.old_oid.clone(),

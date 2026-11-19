@@ -1,10 +1,10 @@
 //! Stashes: push (everything, selected files, or only what is staged), apply, pop, drop
-//! (with undo).
+//! (with undo), and the files a stash holds.
 
 use std::path::Path;
 
-use crate::parse::StashEntry;
-use crate::{Git, GitError};
+use crate::parse::{parse_changed_files, ChangedFile, StashEntry};
+use crate::{CancellationToken, Git, GitError};
 
 /// What [`stash_push`] puts away.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -99,4 +99,84 @@ pub async fn restore_stash(git: &Git, root: &Path, entry: &StashEntry) -> Result
         .run()
         .await
         .map(drop)
+}
+
+/// One file a stash holds, and the two commits its diff is read between.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StashFile {
+    pub file: ChangedFile,
+    /// Stashed while untracked (it comes from the stash's third parent).
+    pub untracked: bool,
+    /// The older side of the diff; `None` is the empty tree (untracked files).
+    pub old: Option<String>,
+    pub new: String,
+}
+
+/// The files a stash holds: its tracked changes against the commit it was made on (staged
+/// and unstaged together, as they come back when it is applied), then its untracked files.
+pub async fn stash_files(
+    git: &Git,
+    root: &Path,
+    entry: &StashEntry,
+    cancel: Option<&CancellationToken>,
+) -> Result<Vec<StashFile>, GitError> {
+    let diff_tree = || {
+        let command = git
+            .command([
+                "diff-tree",
+                "-r",
+                "-z",
+                "-M",
+                "--raw",
+                "--numstat",
+                "--no-commit-id",
+            ])
+            .current_dir(root)
+            .background();
+        match cancel {
+            Some(cancel) => command.cancel_with(cancel),
+            None => command,
+        }
+    };
+    let tracked = match &entry.base {
+        Some(base) => diff_tree().args([base.as_str(), entry.oid.as_str()]),
+        None => diff_tree().args(["--root", entry.oid.as_str()]),
+    };
+    let untracked = async {
+        if !entry.untracked {
+            return Ok(None);
+        }
+        let mut parent = git
+            .command(["rev-parse", "--verify", "-q"])
+            .arg(format!("{}^3^{{commit}}", entry.oid))
+            .current_dir(root)
+            .background();
+        if let Some(cancel) = cancel {
+            parent = parent.cancel_with(cancel);
+        }
+        let oid = String::from_utf8_lossy(&parent.run().await?.stdout)
+            .trim()
+            .to_owned();
+        let output = diff_tree().args(["--root", oid.as_str()]).run().await?;
+        Ok::<_, GitError>(Some((oid, parse_changed_files(&output.stdout)?)))
+    };
+    let (tracked, untracked) = tokio::join!(tracked.run(), untracked);
+    let mut files: Vec<StashFile> = parse_changed_files(&tracked?.stdout)?
+        .into_iter()
+        .map(|file| StashFile {
+            file,
+            untracked: false,
+            old: entry.base.clone(),
+            new: entry.oid.clone(),
+        })
+        .collect();
+    if let Some((oid, untracked)) = untracked? {
+        files.extend(untracked.into_iter().map(|file| StashFile {
+            file,
+            untracked: true,
+            old: None,
+            new: oid.clone(),
+        }));
+    }
+    Ok(files)
 }

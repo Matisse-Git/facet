@@ -9,9 +9,72 @@ use facet_git::parse::{RefKind, Track};
 use facet_git::{
     add_remote, create_branch, create_tag, delete_branch, delete_tag, fetch, pull, push, push_tag,
     refs, remove_remote, rename_branch, restore_branch, restore_remote, restore_stash, restore_tag,
-    stash_apply, stash_drop, stash_push, switch, valid_branch_name, valid_tag_name,
+    stash_apply, stash_drop, stash_files, stash_push, switch, valid_branch_name, valid_tag_name,
     CancellationToken, Network, ProgressFn, PullMode, PushRequest, StashOptions, SwitchTarget,
 };
+
+#[tokio::test]
+async fn stash_files_lists_tracked_then_untracked_changes() {
+    let repo = TestRepo::init().await;
+    repo.commit_file(
+        "a.txt", "a
+", "first",
+    )
+    .await;
+    repo.commit_file(
+        "b.txt", "b
+", "second",
+    )
+    .await;
+    let base = rev(&repo, "HEAD").await;
+    // One staged change, one unstaged, one untracked.
+    repo.write(
+        "a.txt",
+        "a changed
+more
+",
+    );
+    repo.git_ok(&["add", "a.txt"]).await;
+    repo.remove("b.txt");
+    repo.write(
+        "new.txt", "new
+",
+    );
+    stash_push(
+        &repo.git,
+        &repo.path,
+        &StashOptions {
+            message: "mixed".into(),
+            include_untracked: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let entry = refs(&repo.git, &repo.path).await.unwrap().stashes[0].clone();
+
+    let files = stash_files(&repo.git, &repo.path, &entry, None)
+        .await
+        .unwrap();
+    let listed: Vec<(&str, char, bool)> = files
+        .iter()
+        .map(|f| (f.file.path.as_str(), f.file.status, f.untracked))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            ("a.txt", 'M', false),
+            ("b.txt", 'D', false),
+            ("new.txt", 'A', true)
+        ]
+    );
+    assert_eq!(files[0].old.as_deref(), Some(base.as_str()));
+    assert_eq!(files[0].new, entry.oid);
+    assert_eq!(files[0].file.added, Some(2));
+    // Untracked files compare the stash's third parent with the empty tree.
+    assert_eq!(files[2].old, None);
+    assert_eq!(files[2].new, rev(&repo, &format!("{}^3", entry.oid)).await);
+}
 
 async fn rev(repo: &TestRepo, rev: &str) -> String {
     String::from_utf8(repo.git_ok(&["rev-parse", rev]).await)

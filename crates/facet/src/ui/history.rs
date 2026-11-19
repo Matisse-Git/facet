@@ -200,7 +200,7 @@ impl FacetApp {
     }
 }
 
-fn centered_message(ui: &Ui, rect: Rect, title: &str, detail: &str) {
+pub(super) fn centered_message(ui: &Ui, rect: Rect, title: &str, detail: &str) {
     let palette = Palette::of(ui.ctx());
     let center = rect.center();
     ui.painter().text(
@@ -703,7 +703,18 @@ fn detail_pane(
     widgets::hairline_h(ui, rect.x_range().into(), meta.bottom());
     let selected_file = view.selected_file;
     region(ui, "commit-files", list, |ui| {
-        file_list(ui, files, &detail.oid, selected_file, actions);
+        file_list(
+            ui,
+            files.len(),
+            |index| FileItem {
+                file: &files[index],
+                untracked: false,
+                rev: &detail.oid,
+            },
+            selected_file,
+            &FileListKind::COMMIT,
+            actions,
+        );
     });
     widgets::hairline_h(ui, rect.x_range().into(), list.bottom());
     if files.is_empty() {
@@ -847,31 +858,66 @@ fn commit_meta(
         });
 }
 
-fn file_list(
+/// One row of a read-only file list.
+pub(super) struct FileItem<'a> {
+    pub file: &'a ChangedFile,
+    /// A stashed untracked file: drawn as `U`, like in the working copy.
+    pub untracked: bool,
+    /// The commit the file is at (for blame).
+    pub rev: &'a str,
+}
+
+/// What a read-only file list belongs to: a commit of the history, or a stash.
+pub(super) struct FileListKind {
+    id: &'static str,
+    select: fn(usize) -> Action,
+    blame: &'static str,
+}
+
+impl FileListKind {
+    pub const COMMIT: Self = Self {
+        id: "commit-files",
+        select: Action::SelectCommitFile,
+        blame: "Blame at This Commit",
+    };
+    pub const STASH: Self = Self {
+        id: "stash-files",
+        select: Action::SelectStashFile,
+        blame: "Blame in This Stash",
+    };
+}
+
+/// The files of a commit or a stash: status letter, path, line counts.
+pub(super) fn file_list<'a>(
     ui: &mut Ui,
-    files: &[ChangedFile],
-    oid: &str,
+    count: usize,
+    item: impl Fn(usize) -> FileItem<'a>,
     selected: Option<usize>,
+    kind: &FileListKind,
     actions: &mut Vec<Action>,
 ) {
     let palette = Palette::of(ui.ctx());
     ui.spacing_mut().item_spacing.y = 0.0;
     ScrollArea::vertical()
-        .id_salt("commit-files-scroll")
+        .id_salt((kind.id, "scroll"))
         .auto_shrink(false)
-        .show_rows(ui, FILE_ROW, files.len(), |ui, range| {
+        .show_rows(ui, FILE_ROW, count, |ui, range| {
             let left = ui.max_rect().left();
             let width = ui.max_rect().width();
             let top = ui.max_rect().top() - range.start as f32 * FILE_ROW;
             for index in range {
-                let file = &files[index];
+                let FileItem {
+                    file,
+                    untracked,
+                    rev,
+                } = item(index);
                 let row = Rect::from_min_size(
                     Pos2::new(left, top + index as f32 * FILE_ROW),
                     Vec2::new(width, FILE_ROW),
                 );
-                let response = ui.interact(row, Id::unique(("commit-file", index)), Sense::click());
+                let response = ui.interact(row, Id::unique((kind.id, index)), Sense::click());
                 if response.clicked() {
-                    actions.push(Action::SelectCommitFile(index));
+                    actions.push((kind.select)(index));
                 }
                 let inner = row.shrink2(Vec2::new(space::XS, 1.0));
                 let fill = if selected == Some(index) {
@@ -883,6 +929,7 @@ fn file_list(
                     .rect_filled(inner, CornerRadius::same(radius::M), fill);
                 let center = row.center().y;
                 let (letter, color) = match file.status {
+                    _ if untracked => ('U', palette.success),
                     'A' => ('A', palette.success),
                     'D' => ('D', palette.danger),
                     'R' => ('R', palette.accent),
@@ -940,8 +987,13 @@ fn file_list(
                     palette.text,
                     (right - x - space::XS).max(0.0),
                 );
+                let response = if untracked {
+                    response.on_hover_text("New file (was untracked)")
+                } else {
+                    response
+                };
                 if response.secondary_clicked() {
-                    actions.push(Action::SelectCommitFile(index));
+                    actions.push((kind.select)(index));
                 }
                 response.context_menu(|ui| {
                     menu_item(
@@ -953,10 +1005,10 @@ fn file_list(
                     if file.status != 'D' {
                         menu_item(
                             ui,
-                            "Blame at This Commit",
+                            kind.blame,
                             Action::Blame {
                                 path: file.path.clone(),
-                                rev: Some(oid.to_owned()),
+                                rev: Some(rev.to_owned()),
                             },
                             actions,
                         );

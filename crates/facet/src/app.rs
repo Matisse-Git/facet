@@ -21,7 +21,7 @@ use crate::app_repo::NetworkOp;
 use crate::app_settings::{SettingsEvent, SettingsView};
 use crate::app_trees::LfsState;
 use crate::app_work::WorkEvent;
-use crate::history::{History, RefsState, View};
+use crate::history::{History, RefsState, StashView, View};
 use crate::integrations::Installed;
 use crate::platform::{self, Chrome};
 use crate::power::PowerState;
@@ -88,11 +88,13 @@ pub struct RepoTab {
     pub(crate) ops: Arc<tokio::sync::Mutex<()>>,
     /// `.git/index` as Facet last left it, to tell its own writes from outside changes.
     pub(crate) index_stamp: IndexStamp,
-    /// Changes or History.
+    /// Changes, History or a stash.
     pub view: View,
     /// Branches, tags, remotes, stashes.
     pub refs: RefsState,
     pub history: History,
+    /// The stash shown in the stash view.
+    pub stash: StashView,
     /// The fetch / pull / push in flight (one per repository).
     pub network: Option<NetworkOp>,
     /// The operation in progress, undo points, search, blame, rebase and conflict editors.
@@ -382,6 +384,7 @@ impl FacetApp {
             view: View::default(),
             refs: RefsState::default(),
             history: History::default(),
+            stash: StashView::default(),
             network: None,
             power: PowerState::default(),
             lfs: LfsState::default(),
@@ -800,6 +803,30 @@ impl FacetApp {
                 }
             });
             self.pending.extend(actions);
+            return;
+        }
+        // The stash view is read-only: the arrows move through its files, and the working
+        // copy's shortcuts (stage, discard…) must not act on the hidden list.
+        if let Some(stash) = self
+            .active_tab()
+            .filter(|tab| tab.view == View::Stash)
+            .map(|tab| &tab.stash)
+        {
+            let count = stash.files().len();
+            let current = stash.selected_file;
+            ctx.input_mut(|input| {
+                let step = if input.consume_shortcut(&shortcut::NEXT_FILE) {
+                    1
+                } else if input.consume_shortcut(&shortcut::PREVIOUS_FILE) {
+                    -1
+                } else {
+                    return;
+                };
+                let next = current.map_or(0, |file| file.saturating_add_signed(step));
+                if next < count {
+                    self.pending.push(Action::SelectStashFile(next));
+                }
+            });
             return;
         }
         let Some(work) = self.active_work() else {

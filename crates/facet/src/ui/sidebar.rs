@@ -165,6 +165,12 @@ impl FacetApp {
         let rows = self.sidebar_rows();
         let forge = self.forge().map(|forge| forge.kind);
         let active_path = self.active_tab().map(|tab| tab.path.clone());
+        // The stash shown in the stash view is highlighted like the current page.
+        let shown_stash = self
+            .active_tab()
+            .filter(|tab| tab.view == View::Stash && !settings_open)
+            .and_then(|tab| tab.stash.entry.as_ref())
+            .map(|entry| entry.oid.clone());
 
         region(ui, "sidebar-list", list, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
@@ -186,6 +192,7 @@ impl FacetApp {
                             index,
                             &rows[index],
                             active_path.as_deref(),
+                            shown_stash.as_deref(),
                             forge,
                             palette,
                             &mut actions,
@@ -532,6 +539,7 @@ fn draw_row(
     index: usize,
     row: &Row<'_>,
     active_path: Option<&std::path::Path>,
+    shown_stash: Option<&str>,
     forge: Option<ForgeKind>,
     palette: &Palette,
     actions: &mut Vec<Action>,
@@ -917,9 +925,12 @@ fn draw_row(
                 ui,
                 rect,
                 Id::unique(("sidebar-stash", index)),
-                false,
+                shown_stash == Some(entry.oid.as_str()),
                 palette,
             );
+            if response.clicked() {
+                actions.push(Action::ShowStash(*position));
+            }
             // Apply / pop on hover.
             let hovered = ui.rect_contains_pointer(rect);
             if hovered {

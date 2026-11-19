@@ -130,6 +130,9 @@ pub enum Action {
     /// Show this commit in the history (a branch, tag or stash clicked in the sidebar).
     RevealCommit(String),
     SelectCommitFile(usize),
+    /// Show the files of this stash (its position in the list) and their diffs.
+    ShowStash(usize),
+    SelectStashFile(usize),
     ToggleSidebarSection(String),
 
     // ----- branches and tags -----------------------------------------------------------------
@@ -911,17 +914,19 @@ fn repo_commands(
     repo: &RepoContext,
     add: &mut impl FnMut(String, Option<KeyboardShortcut>, Action),
 ) {
-    match repo.view {
-        View::History => add(
+    if repo.view != View::Changes {
+        add(
             "Show Changes".into(),
             Some(shortcut::SHOW_CHANGES),
             Action::ShowChanges,
-        ),
-        View::Changes => add(
+        );
+    }
+    if repo.view != View::History {
+        add(
             "Show History".into(),
             Some(shortcut::SHOW_HISTORY),
             Action::ShowHistory,
-        ),
+        );
     }
     if repo.view == View::History && repo.has_commits {
         add(

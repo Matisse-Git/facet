@@ -56,13 +56,18 @@ impl FacetApp {
             self.pending.extend(actions);
             return;
         }
-        if self
-            .active_tab()
-            .is_some_and(|tab| tab.view == View::History)
-        {
-            self.history_view(ui, body, &mut actions);
-            self.pending.extend(actions);
-            return;
+        match self.active_tab().map(|tab| tab.view) {
+            Some(View::History) => {
+                self.history_view(ui, body, &mut actions);
+                self.pending.extend(actions);
+                return;
+            }
+            Some(View::Stash) => {
+                self.stash_view(ui, body, &mut actions);
+                self.pending.extend(actions);
+                return;
+            }
+            _ => {}
         }
         let width = self
             .settings

@@ -5,17 +5,19 @@
 use std::collections::HashMap;
 
 use facet_git::graph::GraphRow;
-use facet_git::parse::{ChangedFile, CommitDetail, GitRef, LogCommit, RefKind};
-use facet_git::{CancellationToken, Oid, RefsSnapshot, SearchKind};
+use facet_git::parse::{ChangedFile, CommitDetail, GitRef, LogCommit, RefKind, StashEntry};
+use facet_git::{CancellationToken, Oid, RefsSnapshot, SearchKind, StashFile};
 
 use crate::workspace::DiffView;
 
-/// Which of the two main views a repository tab shows.
+/// Which main view a repository tab shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum View {
     #[default]
     Changes,
     History,
+    /// The files of the stash clicked in the sidebar (`RepoTab::stash`).
+    Stash,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +146,60 @@ impl CommitView {
             DetailBody::Loaded { detail, .. } => Some(detail),
             _ => None,
         }
+    }
+}
+
+pub enum StashBody {
+    Loading,
+    Loaded(Vec<StashFile>),
+    Failed(String),
+}
+
+/// The stash shown in the stash view: its files and the diff of one of them.
+pub struct StashView {
+    /// `None` when no stash is shown (or the shown one was dropped).
+    pub entry: Option<StashEntry>,
+    pub body: StashBody,
+    pub generation: u64,
+    pub cancel: Option<CancellationToken>,
+    pub selected_file: Option<usize>,
+    pub diff: DiffView,
+}
+
+impl Default for StashView {
+    fn default() -> Self {
+        Self {
+            entry: None,
+            body: StashBody::Loading,
+            generation: 0,
+            cancel: None,
+            selected_file: None,
+            diff: DiffView::default(),
+        }
+    }
+}
+
+impl StashView {
+    pub fn files(&self) -> &[StashFile] {
+        match &self.body {
+            StashBody::Loaded(files) => files,
+            _ => &[],
+        }
+    }
+
+    /// Stop the loads in flight and forget the shown diff.
+    pub fn cancel(&mut self) {
+        for token in [self.cancel.take(), self.diff.cancel.take()]
+            .into_iter()
+            .flatten()
+        {
+            token.cancel();
+        }
+        self.generation += 1;
+        self.diff.generation += 1;
+        self.diff.key = None;
+        self.diff.body = crate::workspace::DiffBody::None;
+        self.selected_file = None;
     }
 }
 

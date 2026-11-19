@@ -19,6 +19,7 @@ mod power;
 pub mod prompt;
 mod settings;
 mod sidebar;
+mod stash;
 mod titlebar;
 pub mod toast;
 pub mod widgets;

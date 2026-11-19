@@ -78,17 +78,20 @@ pub enum WorkEvent {
     Repo(RepoEvent),
 }
 
-/// Which diff pane a load belongs to: the working copy's, or the history's commit detail.
+/// Which diff pane a load belongs to: the working copy's, the history's commit detail, or
+/// the stash view's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffSlot {
     Work,
     Commit,
+    Stash,
 }
 
 pub(crate) fn diff_view(tab: &RepoTab, slot: DiffSlot) -> &DiffView {
     match slot {
         DiffSlot::Work => &tab.work.diff,
         DiffSlot::Commit => &tab.history.commit.diff,
+        DiffSlot::Stash => &tab.stash.diff,
     }
 }
 
@@ -96,6 +99,7 @@ pub(crate) fn diff_view_mut(tab: &mut RepoTab, slot: DiffSlot) -> &mut DiffView 
     match slot {
         DiffSlot::Work => &mut tab.work.diff,
         DiffSlot::Commit => &mut tab.history.commit.diff,
+        DiffSlot::Stash => &mut tab.stash.diff,
     }
 }
 
@@ -1245,6 +1249,7 @@ impl FacetApp {
         for index in 0..self.tabs.len() {
             self.decorate(index, DiffSlot::Work);
             self.decorate(index, DiffSlot::Commit);
+            self.decorate(index, DiffSlot::Stash);
         }
     }
 }

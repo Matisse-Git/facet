@@ -11,15 +11,16 @@ use facet_git::graph::{GraphBuilder, GraphRow};
 use facet_git::parse::{ChangedFile, CommitDetail, EntryKind, LfsLock, LogCommit, RefKind};
 use facet_git::{
     same_dir, CancellationToken, DiffRequest, DiffSource, Git, GitError, Head, LfsUsage, Network,
-    Operation, ProgressFn, PushRequest, RefsSnapshot, RepoInfo, StashOptions, SwitchTarget,
+    Operation, ProgressFn, PushRequest, RefsSnapshot, RepoInfo, StashFile, StashOptions,
+    SwitchTarget,
 };
 
 use crate::actions::{Action, RepoContext};
 use crate::app::{describe_error, Event, FacetApp, RepoTab, TabState};
 use crate::app_power::{PowerEvent, Rewrote};
 use crate::app_trees::{native_path, TreeEvent};
-use crate::app_work::{perf_log, plural, ready_info, DiffSlot, WorkEvent};
-use crate::history::{badges, tips, DetailBody, View};
+use crate::app_work::{diff_view_mut, perf_log, plural, ready_info, DiffSlot, WorkEvent};
+use crate::history::{badges, tips, DetailBody, StashBody, View};
 use crate::loader::{self, LoadContext};
 use crate::platform;
 use crate::settings::ExternalTool;
@@ -52,6 +53,11 @@ pub enum RepoEvent {
     Detail {
         generation: u64,
         result: Result<(CommitDetail, Vec<ChangedFile>), GitError>,
+    },
+    /// The files of the stash shown in the stash view.
+    StashFiles {
+        generation: u64,
+        result: Result<Vec<StashFile>, GitError>,
     },
     /// A branch / tag / remote / stash operation finished.
     Op {
@@ -265,6 +271,8 @@ impl FacetApp {
                 tab.refs.snapshot = snapshot;
                 tab.refs.tips = Some(current.clone());
                 tab.refs.loaded = true;
+                self.sync_shown_stash(index);
+                let tab = &mut self.tabs[index];
                 // A filtered list stays as it is; leaving it reads the history again.
                 let shown =
                     (tab.history.loaded || tab.history.loading) && tab.history.filter.is_none();
@@ -489,32 +497,46 @@ impl FacetApp {
         let Some(tab) = self.tabs.get_mut(index) else {
             return;
         };
-        let Some(info) = ready_info(tab).cloned() else {
-            return;
-        };
         let view = &mut tab.history.commit;
         let (Some(detail), Some(changed)) = (view.detail(), view.files().get(file)) else {
             return;
         };
-        let request = DiffRequest {
-            path: changed.path.clone(),
-            orig_path: changed.orig_path.clone(),
-            source: DiffSource::Commit {
-                old: detail.parents.first().cloned(),
-                new: detail.oid.clone(),
-            },
-        };
-        let (old_oid, new_oid) = (changed.old_oid.clone(), changed.new_oid.clone());
-        let submodule = changed.submodule;
+        let old = detail.parents.first().cloned();
+        let new = detail.oid.clone();
+        let changed = changed.clone();
         view.selected_file = Some(file);
-        let diff = &mut view.diff;
+        self.load_readonly_diff(index, DiffSlot::Commit, &changed, old, new);
+    }
+
+    /// Load the diff of `file` between two commits (`old: None` is the empty tree) into a
+    /// read-only diff pane: a commit's or a stash's.
+    fn load_readonly_diff(
+        &mut self,
+        index: usize,
+        slot: DiffSlot,
+        file: &ChangedFile,
+        old: Option<String>,
+        new: String,
+    ) {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        let Some(info) = ready_info(tab).cloned() else {
+            return;
+        };
+        let request = DiffRequest {
+            path: file.path.clone(),
+            orig_path: file.orig_path.clone(),
+            source: DiffSource::Commit { old, new },
+        };
+        let diff = diff_view_mut(tab, slot);
         if let Some(cancel) = diff.cancel.take() {
             cancel.cancel();
         }
         diff.generation += 1;
         diff.body = DiffBody::Loading;
         diff.reset_scroll = true;
-        // Commit diffs are read-only; the area only matters for staging actions.
+        // These diffs are read-only; the area only matters for staging actions.
         diff.key = Some(DiffKey {
             area: Area::Staged,
             request: request.clone(),
@@ -526,11 +548,11 @@ impl FacetApp {
             git: self.git.clone(),
             info,
             request,
-            head_oid: old_oid,
-            index_oid: new_oid,
+            head_oid: file.old_oid.clone(),
+            index_oid: file.new_oid.clone(),
             ctx: self.ctx.clone(),
             cancel,
-            submodule,
+            submodule: file.submodule,
         };
         let tab = &self.tabs[index];
         self.spawn_work(tab, false, async move {
@@ -539,11 +561,127 @@ impl FacetApp {
                 result = loader::load(&cx) => result,
             };
             WorkEvent::Diff {
-                slot: DiffSlot::Commit,
+                slot,
                 generation,
                 result,
             }
         });
+    }
+
+    // ----- stashes ------------------------------------------------------------------------
+
+    /// Show the files of the stash at `position` in the list, opening the first one.
+    fn show_stash(&mut self, index: usize, position: usize) {
+        let Some(entry) = self.tabs[index]
+            .refs
+            .snapshot
+            .stashes
+            .get(position)
+            .cloned()
+        else {
+            return;
+        };
+        self.show_view(View::Stash);
+        let tab = &mut self.tabs[index];
+        if tab.view != View::Stash {
+            return;
+        }
+        let Some(root) = ready_info(tab).map(|info| info.root().to_owned()) else {
+            return;
+        };
+        let view = &mut tab.stash;
+        // Clicking the stash already shown keeps its selection and scroll.
+        if view
+            .entry
+            .as_ref()
+            .is_some_and(|shown| shown.oid == entry.oid)
+            && !matches!(view.body, StashBody::Failed(_))
+        {
+            view.entry = Some(entry);
+            return;
+        }
+        view.cancel();
+        view.entry = Some(entry.clone());
+        view.body = StashBody::Loading;
+        let cancel = CancellationToken::new();
+        view.cancel = Some(cancel.clone());
+        let generation = view.generation;
+        let git = self.git.clone();
+        let tab = &self.tabs[index];
+        self.spawn_work(tab, false, async move {
+            let result = facet_git::stash_files(&git, &root, &entry, Some(&cancel)).await;
+            WorkEvent::Repo(RepoEvent::StashFiles { generation, result })
+        });
+    }
+
+    fn on_stash_files(
+        &mut self,
+        index: usize,
+        generation: u64,
+        result: Result<Vec<StashFile>, GitError>,
+    ) {
+        let view = &mut self.tabs[index].stash;
+        if generation != view.generation {
+            return;
+        }
+        view.cancel = None;
+        match result {
+            Ok(files) => {
+                let any = !files.is_empty();
+                view.body = StashBody::Loaded(files);
+                if any {
+                    self.select_stash_file(index, 0);
+                }
+            }
+            Err(GitError::Cancelled) => {}
+            Err(error) => {
+                view.body = StashBody::Failed(describe_error(&error).1.unwrap_or_default());
+            }
+        }
+    }
+
+    fn select_stash_file(&mut self, index: usize, file: usize) {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        let view = &mut tab.stash;
+        let Some(stashed) = view.files().get(file).cloned() else {
+            return;
+        };
+        view.selected_file = Some(file);
+        self.load_readonly_diff(
+            index,
+            DiffSlot::Stash,
+            &stashed.file,
+            stashed.old,
+            stashed.new,
+        );
+    }
+
+    /// The stash list was read again: follow the shown stash to its new position, or leave
+    /// the stash view when it is gone (popped or dropped).
+    fn sync_shown_stash(&mut self, index: usize) {
+        let tab = &mut self.tabs[index];
+        let Some(shown) = tab.stash.entry.as_ref() else {
+            return;
+        };
+        match tab
+            .refs
+            .snapshot
+            .stashes
+            .iter()
+            .find(|entry| entry.oid == shown.oid)
+        {
+            Some(entry) => tab.stash.entry = Some(entry.clone()),
+            None => {
+                tab.stash.cancel();
+                tab.stash.entry = None;
+                tab.stash.body = StashBody::Loading;
+                if tab.view == View::Stash {
+                    tab.view = View::Changes;
+                }
+            }
+        }
     }
 
     pub(crate) fn show_view(&mut self, view: View) {
@@ -1145,6 +1283,9 @@ impl FacetApp {
             RepoEvent::Detail { generation, result } => {
                 self.on_detail(index, generation, result);
             }
+            RepoEvent::StashFiles { generation, result } => {
+                self.on_stash_files(index, generation, result);
+            }
             RepoEvent::Op { what, result } => self.on_op(index, &what, result),
             RepoEvent::Network {
                 job,
@@ -1225,6 +1366,8 @@ impl FacetApp {
                 }
             }
             Action::SelectCommitFile(file) => self.select_commit_file(index, file),
+            Action::ShowStash(position) => self.show_stash(index, position),
+            Action::SelectStashFile(file) => self.select_stash_file(index, file),
 
             Action::NewBranch { at } => {
                 let Some((oid, label)) = self.start_point(at) else {
