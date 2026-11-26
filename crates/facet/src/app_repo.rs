@@ -1233,7 +1233,8 @@ impl FacetApp {
                 Head::Detached { .. } => None,
             },
             has_commits: head.commit().is_some(),
-            upstream: work.branch.upstream.clone(),
+            // A gone upstream can't be pulled or force-pushed to; pushing publishes it again.
+            upstream: work.branch.upstream.clone().filter(|_| !work.branch.upstream_gone()),
             local_branches: snapshot
                 .local()
                 .filter(|r| !r.head)
@@ -1876,7 +1877,10 @@ pub(crate) fn sync_step(tab: &RepoTab) -> Option<Action> {
     Some(
         if branch.upstream.is_some() && branch.behind.is_some_and(|n| n > 0) {
             Action::Pull
-        } else if on_branch && (branch.upstream.is_none() || branch.ahead.is_some_and(|n| n > 0)) {
+        } else if on_branch
+            && branch.oid.is_some()
+            && (branch.unpublished() || branch.ahead.is_some_and(|n| n > 0))
+        {
             Action::Push
         } else {
             Action::Fetch

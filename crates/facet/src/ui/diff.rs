@@ -454,8 +454,11 @@ pub(super) fn clean_state(ui: &Ui, rect: Rect, work: &Workspace, actions: &mut V
     };
     let push = if branch.oid.is_none() {
         None
-    } else if branch.upstream.is_none() && branch.head.is_some() {
-        detail.push_str(" This branch isn’t published yet.");
+    } else if branch.unpublished() && branch.head.is_some() {
+        match &branch.upstream {
+            Some(upstream) => detail.push_str(&format!(" {upstream} isn’t on the remote yet.")),
+            None => detail.push_str(" This branch isn’t published yet."),
+        }
         Some("Publish Branch".to_owned())
     } else if ahead > 0 {
         let commits = if ahead == 1 {

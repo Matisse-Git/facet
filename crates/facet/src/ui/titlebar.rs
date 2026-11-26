@@ -573,6 +573,9 @@ impl FacetApp {
         let info = &tab.work.branch;
         let status = match (&info.upstream, info.ahead.unwrap_or(0), info.behind.unwrap_or(0)) {
             (None, ..) => "Not published yet".to_owned(),
+            (Some(upstream), ..) if info.upstream_gone() => {
+                format!("{upstream} isn’t on the remote yet")
+            }
             (Some(upstream), 0, 0) => format!("Up to date with {upstream}"),
             (Some(upstream), ahead, 0) => format!("{ahead} ahead of {}", remote_of(upstream)),
             (Some(upstream), 0, behind) => format!("{behind} behind {}", remote_of(upstream)),
@@ -999,7 +1002,7 @@ impl FacetApp {
                 "Pull from {upstream} ({}), then Sync again to push",
                 self.settings.pull_mode.label()
             ),
-            Action::Push if branch.upstream.is_none() => {
+            Action::Push if branch.unpublished() => {
                 "Publish this branch to the remote".to_owned()
             }
             Action::Push => format!("Push to {upstream}"),

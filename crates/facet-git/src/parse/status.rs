@@ -21,6 +21,20 @@ pub struct BranchInfo {
     pub behind: Option<u32>,
 }
 
+impl BranchInfo {
+    /// The branch has an upstream that does not exist: cloned from an empty repository, or
+    /// the remote branch was deleted. Git then leaves out the ahead/behind counts. Pushing
+    /// creates it again.
+    pub fn upstream_gone(&self) -> bool {
+        self.upstream.is_some() && self.ahead.is_none()
+    }
+
+    /// Pushing would create the branch on the remote: there is no upstream, or it is gone.
+    pub fn unpublished(&self) -> bool {
+        self.upstream.is_none() || self.upstream_gone()
+    }
+}
+
 /// One side (index or working tree) of an entry's `XY` status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Change {
@@ -321,6 +335,26 @@ mod tests {
         let status = parse(&format!("# branch.oid {A}\0# branch.head (detached)\0"));
         assert_eq!(status.branch.head, None);
         assert_eq!(status.branch.ahead, None);
+    }
+
+    #[test]
+    fn upstream_that_does_not_exist_yet() {
+        // Cloned from an empty repository, then committed: no `branch.ab` header.
+        let status = parse(&format!(
+            "# branch.oid {A}\0# branch.head main\0# branch.upstream origin/main\0"
+        ));
+        assert!(status.branch.upstream_gone());
+        assert!(status.branch.unpublished());
+
+        let status = parse(&format!(
+            "# branch.oid {A}\0# branch.head main\0# branch.upstream origin/main\0# branch.ab +0 -0\0"
+        ));
+        assert!(!status.branch.upstream_gone());
+        assert!(!status.branch.unpublished());
+
+        let status = parse(&format!("# branch.oid {A}\0# branch.head main\0"));
+        assert!(!status.branch.upstream_gone());
+        assert!(status.branch.unpublished());
     }
 
     #[test]
