@@ -52,6 +52,34 @@ pub async fn commit(
     })
 }
 
+/// The author name and email of the commit at `HEAD` (amending keeps them). `None` when
+/// there is no commit yet.
+pub async fn last_commit_author(
+    git: &Git,
+    root: &Path,
+) -> Result<Option<(String, String)>, GitError> {
+    let output = git
+        .command([
+            "log",
+            "-1",
+            "--no-show-signature",
+            "--format=%an%x00%ae",
+            "HEAD",
+        ])
+        .current_dir(root)
+        .background()
+        .output()
+        .await?;
+    if !output.success() {
+        return Ok(None); // unborn branch
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let text = text.trim_end_matches(['\r', '\n']);
+    Ok(text
+        .split_once('\0')
+        .map(|(name, email)| (name.to_owned(), email.to_owned())))
+}
+
 /// The full message of the commit at `HEAD` (for pre-filling the editor when amending).
 /// `None` when there is no commit yet.
 pub async fn last_commit_message(git: &Git, root: &Path) -> Result<Option<String>, GitError> {

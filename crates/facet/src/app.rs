@@ -177,6 +177,8 @@ pub struct FacetApp {
     applied_dark: Option<bool>,
     picking_folder: bool,
     was_focused: bool,
+    /// The tab whose commit identity was last read on becoming active.
+    identity_tab: Option<u64>,
 
     startup: Instant,
     /// Which GPU adapter is rendering, for the startup trace.
@@ -273,6 +275,7 @@ impl FacetApp {
                 .unwrap_or_else(|| "unknown adapter".to_owned()),
             picking_folder: false,
             was_focused: true,
+            identity_tab: None,
             startup,
             frames: 0,
             bench: crate::bench::ScrollBench::from_env(),
@@ -335,7 +338,10 @@ impl FacetApp {
 
     fn handle_event(&mut self, event: Event) {
         match event {
-            Event::GitVersion(Ok(version)) => self.git_status = GitStatus::Found(version),
+            Event::GitVersion(Ok(version)) => {
+                self.git_status = GitStatus::Found(version);
+                self.seed_identities();
+            }
             Event::GitVersion(Err(error)) => {
                 let detail = error.to_string();
                 self.error_toast(
@@ -948,12 +954,22 @@ impl FacetApp {
                 if self.active_work().is_some() {
                     self.request_status(index, false);
                     self.request_refs(index);
+                    // `git config` changed in a terminal shows up too.
+                    self.request_identity(index);
                 } else {
                     self.load_tab(index);
                 }
             }
         }
         self.was_focused = focused;
+        // Switching tabs re-reads the commit identity of the tab switched to.
+        if let Some(index) = self.active.filter(|i| self.tabs[*i].is_ready()) {
+            let id = self.tabs[index].id;
+            if self.identity_tab != Some(id) {
+                self.identity_tab = Some(id);
+                self.request_identity(index);
+            }
+        }
     }
 
     /// Mirror tab state into settings and write settings to disk once they settle.

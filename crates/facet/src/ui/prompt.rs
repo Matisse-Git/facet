@@ -39,6 +39,8 @@ pub enum PromptKind {
     LfsTrack,
     /// Fields: name, email.
     CommitAuthor,
+    /// Fields: label, name, email, hosts. `index`: the saved identity edited (`None`: new).
+    Identity { index: Option<usize> },
 }
 
 #[derive(Debug, Clone, PartialEq)]

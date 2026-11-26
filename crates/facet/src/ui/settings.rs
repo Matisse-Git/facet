@@ -55,6 +55,8 @@ struct Snapshot {
     custom_git: bool,
     /// External tools: label and command line.
     tools: Vec<(String, String)>,
+    /// Saved commit identities.
+    identities: Vec<crate::settings::SavedIdentity>,
     installed: Installed,
     /// A repository tab is open.
     has_repo: bool,
@@ -102,6 +104,7 @@ impl FacetApp {
                     (tool.label(), command.clone())
                 })
                 .collect(),
+            identities: self.settings.identities.clone(),
             installed: self.installed.clone(),
             has_repo: self.active_tab().is_some_and(crate::app::RepoTab::is_ready),
             gitignore_repo: self
@@ -319,6 +322,17 @@ fn main_page(ui: &mut Ui, snap: &Snapshot, view: &mut SettingsView, actions: &mu
                 actions.push(Action::ManageCredentials);
             }
         });
+    }
+
+    // ----- identities
+    let identity_words: Vec<&str> = ["Commit identities", "identity", "author", "email", "host"]
+        .into_iter()
+        .chain(snap.identities.iter().map(|saved| saved.label.as_str()))
+        .collect();
+    if shown(&identity_words) {
+        any = true;
+        section(ui, "Commit identities");
+        identities_card(ui, &snap.identities, actions);
     }
 
     // ----- git
@@ -1076,6 +1090,93 @@ fn stacked_card(
 }
 
 /// A card holding free-form content (padding 16 / 18).
+/// The saved commit identities: one row each with Edit and Remove, then "Add Identity…".
+fn identities_card(
+    ui: &mut Ui,
+    identities: &[crate::settings::SavedIdentity],
+    actions: &mut Vec<Action>,
+) {
+    let palette = Palette::of(ui.ctx());
+    card(ui, |ui| {
+        note(
+            ui,
+            "Pick one per repository from the line above the commit message in Changes; it is \
+             written to that repository's own Git config. Give an identity the hosts it is for, \
+             and Facet warns when a repository there commits as someone else.",
+            palette.text_secondary,
+        );
+        ui.add_space(space::S);
+        for (index, saved) in identities.iter().enumerate() {
+            divider(ui);
+            let (rect, _) =
+                ui.allocate_exact_size(Vec2::new(ui.available_width(), 52.0), Sense::hover());
+            let text_width = rect.width() - 76.0;
+            widgets::text_line(
+                ui,
+                Pos2::new(rect.left(), rect.top() + 16.0),
+                &saved.label,
+                theme::strong(),
+                palette.text,
+                text_width,
+            );
+            let mut detail = format!("{} <{}>", saved.name, saved.email);
+            if !saved.hosts.is_empty() {
+                detail.push_str(&format!("  ·  {}", saved.hosts.join(", ")));
+            }
+            widgets::text_line(
+                ui,
+                Pos2::new(rect.left(), rect.bottom() - 16.0),
+                &detail,
+                theme::small(),
+                palette.text_tertiary,
+                text_width,
+            );
+            let remove = Rect::from_center_size(
+                Pos2::new(rect.right() - 14.0, rect.center().y),
+                Vec2::splat(28.0),
+            );
+            let edit = remove.translate(Vec2::new(-32.0, 0.0));
+            if icon_button_at(
+                ui,
+                edit,
+                Id::unique(("settings-edit-identity", index)),
+                icon::EDIT,
+                "Edit this identity",
+            )
+            .clicked()
+            {
+                actions.push(Action::EditIdentity(Some(index)));
+            }
+            if icon_button_at(
+                ui,
+                remove,
+                Id::unique(("settings-remove-identity", index)),
+                icon::DELETE,
+                "Remove this identity (repositories that use it keep their author)",
+            )
+            .clicked()
+            {
+                actions.push(Action::RemoveIdentity(index));
+            }
+        }
+        if !identities.is_empty() {
+            divider(ui);
+        }
+        ui.add_space(space::S);
+        if button(
+            ui,
+            widgets::ButtonKind::Secondary,
+            Some(icon::ADD),
+            "Add Identity…",
+            "Save a name and email to commit as, e.g. your GitHub profile",
+        )
+        .clicked()
+        {
+            actions.push(Action::EditIdentity(None));
+        }
+    });
+}
+
 fn card(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
     let palette = Palette::of(ui.ctx());
     Frame::NONE

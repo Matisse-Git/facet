@@ -42,8 +42,8 @@ pub mod tools;
 mod worktree;
 
 pub use accounts::{
-    identity, line_endings, set_line_endings, set_local_identity, sign_in, sign_out,
-    stored_accounts, Identity, LineEndings,
+    global_identity, identity, line_endings, set_line_endings, set_local_identity, sign_in,
+    sign_out, stored_accounts, unset_local_identity, Identity, LineEndings,
 };
 pub use branch::{
     create_branch, create_tag, delete_branch, delete_tag, rename_branch, restore_branch,
@@ -52,7 +52,7 @@ pub use branch::{
 };
 pub use clone::{clone, clone_folder_name, init};
 pub use cmdlog::{CommandLog, CommandOutcome, CommandRecord};
-pub use commit::{commit, last_commit_message, CommitOutcome};
+pub use commit::{commit, last_commit_author, last_commit_message, CommitOutcome};
 pub use diff::{
     diff_file, empty_tree, object_sizes, read_blob, DiffRequest, DiffSource, LfsPointer,
 };

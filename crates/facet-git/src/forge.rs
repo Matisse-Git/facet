@@ -50,32 +50,46 @@ fn encode(text: &str, keep_slash: bool) -> String {
     out
 }
 
+/// Split a remote URL into its lower-case host (without user or port) and its path:
+/// `https://`, `http://`, `ssh://`, `git://` and scp-like `[user@]host:path` forms. `None` for
+/// local paths and anything else.
+fn split_remote_url(url: &str) -> Option<(String, String)> {
+    let url = url.trim();
+    if let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .or_else(|| url.strip_prefix("ssh://"))
+        .or_else(|| url.strip_prefix("git://"))
+    {
+        let (authority, path) = rest.split_once('/')?;
+        let host = authority.rsplit('@').next()?;
+        // Drop a port (`host:22`).
+        let host = host.split(':').next()?;
+        Some((host.to_ascii_lowercase(), path.to_owned()))
+    } else if let Some((user_host, path)) = url.split_once(':') {
+        // scp-like syntax: `[user@]host:path` (not a Windows drive letter or local path).
+        if user_host.len() < 2 || user_host.contains('/') || user_host.contains('\\') {
+            return None;
+        }
+        let host = user_host.rsplit('@').next()?;
+        Some((host.to_ascii_lowercase(), path.to_owned()))
+    } else {
+        None
+    }
+}
+
+/// The host of a remote URL exactly as written (an SSH alias stays an alias), lower-case,
+/// without the user or port. `None` for local paths.
+pub fn remote_host(url: &str) -> Option<String> {
+    split_remote_url(url)
+        .map(|(host, _)| host)
+        .filter(|host| !host.is_empty())
+}
+
 impl Forge {
     /// Recognise a remote URL: `https://`, `ssh://` and scp-like `git@host:path` forms.
     pub fn from_remote_url(url: &str) -> Option<Self> {
-        let url = url.trim();
-        // Split into host and path.
-        let (host, path) = if let Some(rest) = url
-            .strip_prefix("https://")
-            .or_else(|| url.strip_prefix("http://"))
-            .or_else(|| url.strip_prefix("ssh://"))
-            .or_else(|| url.strip_prefix("git://"))
-        {
-            let (authority, path) = rest.split_once('/')?;
-            let host = authority.rsplit('@').next()?;
-            // Drop a port (`host:22`).
-            let host = host.split(':').next()?;
-            (host.to_ascii_lowercase(), path.to_owned())
-        } else if let Some((user_host, path)) = url.split_once(':') {
-            // scp-like syntax: `[user@]host:path` (not a Windows drive letter or local path).
-            if user_host.len() < 2 || user_host.contains('/') || user_host.contains('\\') {
-                return None;
-            }
-            let host = user_host.rsplit('@').next()?;
-            (host.to_ascii_lowercase(), path.to_owned())
-        } else {
-            return None;
-        };
+        let (host, path) = split_remote_url(url)?;
         let path = path.trim_matches('/');
         let path = path.strip_suffix(".git").unwrap_or(path);
         if path.is_empty() {
@@ -180,6 +194,24 @@ mod tests {
 
     fn base(url: &str) -> Option<(ForgeKind, String)> {
         Forge::from_remote_url(url).map(|forge| (forge.kind, forge.base))
+    }
+
+    #[test]
+    fn hosts_of_remote_urls() {
+        assert_eq!(
+            remote_host("https://user@GitHub.com:443/o/r.git").as_deref(),
+            Some("github.com")
+        );
+        assert_eq!(
+            remote_host("git@github-personal:me/repo.git").as_deref(),
+            Some("github-personal")
+        );
+        assert_eq!(
+            remote_host("ssh://git@git.corp.example:2222/team/app").as_deref(),
+            Some("git.corp.example")
+        );
+        assert_eq!(remote_host("C:\\repos\\app"), None);
+        assert_eq!(remote_host("../app"), None);
     }
 
     #[test]

@@ -278,6 +278,9 @@ pub struct CommitDraft {
     pub amend: bool,
     /// The last commit's message as loaded when amend was switched on.
     pub amend_original: Option<String>,
+    /// The last commit's author (name, email) as loaded when amend was switched on: amending
+    /// keeps it.
+    pub amend_author: Option<(String, String)>,
     /// `git commit` is running.
     pub running: bool,
     /// What git and the hooks said when the last commit was rejected.
@@ -324,6 +327,8 @@ pub struct Workspace {
     /// The open diff may be out of date: reload it with the next status.
     pub diff_stale: bool,
     pub commit: CommitDraft,
+    /// Who commits are made as here, and where that is set (`None`: still reading).
+    pub identity: Option<facet_git::Identity>,
     /// Discards that can be undone, oldest first.
     pub undo: Vec<UndoEntry>,
     pub refresh: RefreshState,

@@ -99,7 +99,14 @@ pub enum SettingsEvent {
         host: String,
         result: Result<(), GitError>,
     },
-    AuthorSet(Result<(), GitError>),
+    /// The commit author of a repository was set or removed (`done`: the toast on success).
+    AuthorSet {
+        root: PathBuf,
+        done: String,
+        result: Result<(), GitError>,
+    },
+    /// The author in the global Git config, for the first saved identity.
+    GlobalIdentity(Result<facet_git::Identity, GitError>),
     Lfs(Option<String>),
     LineEndings(Option<facet_git::LineEndings>),
     LineEndingsSet(Result<(), GitError>),
@@ -291,16 +298,26 @@ Theme: {:?}
         });
     }
 
+    /// Who commits are made as in the active repository, as last read (the Changes tab's, else
+    /// the settings view's).
+    fn current_identity(&self) -> Option<facet_git::Identity> {
+        self.active_tab()
+            .and_then(|tab| tab.work.identity.clone())
+            .or_else(|| {
+                self.settings_view
+                    .as_ref()
+                    .and_then(|view| view.identity.clone())
+            })
+    }
+
     fn edit_commit_author(&mut self) {
         if self.work_root().is_none() {
             self.info_toast("Open a repository first: Facet sets the author per repository");
             return;
         }
         let (name, email) = self
-            .settings_view
-            .as_ref()
-            .and_then(|view| view.identity.as_ref())
-            .map(|identity| (identity.name.clone(), identity.email.clone()))
+            .current_identity()
+            .map(|identity| (identity.name, identity.email))
             .unwrap_or_default();
         self.prompt = Some(
             Prompt::new(PromptKind::CommitAuthor, "Commit Author", "Save")
@@ -313,16 +330,130 @@ Theme: {:?}
         );
     }
 
-    fn set_commit_author(&mut self, name: String, email: String) {
+    fn set_commit_author(&mut self, name: String, email: String, done: String) {
         let Some(root) = self.work_root() else {
+            self.info_toast("Open a repository first: Facet sets the author per repository");
             return;
         };
         let git = self.git.clone();
         self.spawn(async move {
             let result =
                 facet_git::set_local_identity(&git, &root, name.trim(), email.trim()).await;
-            Event::Settings(SettingsEvent::AuthorSet(result))
+            Event::Settings(SettingsEvent::AuthorSet { root, done, result })
         });
+    }
+
+    /// Commit as saved identity `index` in the active repository.
+    fn use_identity(&mut self, index: usize) {
+        let Some(saved) = self.settings.identities.get(index).cloned() else {
+            return;
+        };
+        self.set_commit_author(
+            saved.name,
+            saved.email,
+            format!("Committing as {} in this repository", saved.label),
+        );
+    }
+
+    /// Drop the active repository's own author: the global one applies again.
+    fn use_global_identity(&mut self) {
+        let Some(root) = self.work_root() else {
+            return;
+        };
+        let git = self.git.clone();
+        self.spawn(async move {
+            let result = facet_git::unset_local_identity(&git, &root).await;
+            Event::Settings(SettingsEvent::AuthorSet {
+                root,
+                done: "This repository uses your global identity again".to_owned(),
+                result,
+            })
+        });
+    }
+
+    /// The first run takes the global author as the "Work" identity (once: an emptied list
+    /// stays empty).
+    pub(crate) fn seed_identities(&self) {
+        if self.settings.identities_seeded {
+            return;
+        }
+        let git = self.git.clone();
+        self.spawn(async move {
+            Event::Settings(SettingsEvent::GlobalIdentity(
+                facet_git::global_identity(&git).await,
+            ))
+        });
+    }
+
+    /// Ask for a new saved identity (`None`) or edit one.
+    fn edit_identity(&mut self, index: Option<usize>) {
+        let saved = match index {
+            Some(index) => match self.settings.identities.get(index) {
+                Some(saved) => saved.clone(),
+                None => return,
+            },
+            // A new identity starts from the current name: usually only the email differs.
+            None => crate::settings::SavedIdentity {
+                name: self
+                    .current_identity()
+                    .map(|identity| identity.name)
+                    .unwrap_or_default(),
+                ..Default::default()
+            },
+        };
+        let (title, submit) = if index.is_some() {
+            ("Edit Identity", "Save")
+        } else {
+            ("Add Identity", "Add")
+        };
+        self.palette.open = false;
+        self.prompt = Some(
+            Prompt::new(PromptKind::Identity { index }, title, submit)
+                .body(
+                    "Pick it per repository from the Changes tab; it is written to that \
+                     repository's own Git config. Hosts are optional: Facet warns when a \
+                     repository on one of them commits as someone else.",
+                )
+                .field(PromptField::new("Label", "Work, GitHub…", true).with_value(&saved.label))
+                .field(PromptField::new("Name", "Your name", true).with_value(&saved.name))
+                .field(
+                    PromptField::new(
+                        "Email",
+                        "you@example.com, or ID+username@users.noreply.github.com",
+                        true,
+                    )
+                    .with_value(&saved.email),
+                )
+                .field(
+                    PromptField::new("Hosts (optional)", "github.com, *.example.co.jp", false)
+                        .with_value(&saved.hosts.join(", ")),
+                ),
+        );
+    }
+
+    fn save_identity(&mut self, index: Option<usize>, identity: crate::settings::SavedIdentity) {
+        let label = identity.label.clone();
+        match index {
+            Some(index) if index < self.settings.identities.len() => {
+                self.settings.identities[index] = identity;
+                self.info_toast(format!("Saved {label}"));
+            }
+            Some(_) => {}
+            None => {
+                self.settings.identities.push(identity);
+                self.info_toast(format!("Added {label}"));
+            }
+        }
+    }
+
+    fn remove_identity(&mut self, index: usize) {
+        if index < self.settings.identities.len() {
+            let saved = self.settings.identities.remove(index);
+            self.info_toast(format!(
+                "Removed {}; repositories that use it keep their author",
+                saved.label
+            ));
+        }
     }
 
     /// Fetch every ready repository whose last fetch is older than the interval in settings.
@@ -568,15 +699,39 @@ Theme: {:?}
                 }
                 self.read_accounts();
             }
-            SettingsEvent::AuthorSet(result) => {
+            SettingsEvent::AuthorSet { root, done, result } => {
                 match result {
-                    Ok(()) => self.info_toast("Commit author saved for this repository"),
+                    Ok(()) => self.info_toast(done),
                     Err(error) => {
                         let (title, detail) = describe_error(&error);
                         self.error_toast("Couldn't set the commit author", detail.or(Some(title)));
                     }
                 }
-                self.read_identity();
+                if self.settings_view.is_some() {
+                    self.read_identity();
+                }
+                let found = self.tabs.iter().position(|tab| {
+                    crate::app_work::ready_info(tab)
+                        .is_some_and(|info| crate::settings::same_path(info.root(), &root))
+                });
+                if let Some(index) = found {
+                    self.request_identity(index);
+                }
+            }
+            SettingsEvent::GlobalIdentity(result) => {
+                if let Ok(identity) = result {
+                    if !self.settings.identities_seeded {
+                        self.settings.identities_seeded = true;
+                        if !identity.is_unset() && self.settings.identities.is_empty() {
+                            self.settings.identities.push(crate::settings::SavedIdentity {
+                                label: "Work".to_owned(),
+                                name: identity.name,
+                                email: identity.email,
+                                hosts: Vec::new(),
+                            });
+                        }
+                    }
+                }
             }
             SettingsEvent::Lfs(version) => {
                 if let Some(view) = &mut self.settings_view {
@@ -721,7 +876,16 @@ Theme: {:?}
             Action::EditCommitAuthor => self.edit_commit_author(),
             Action::SetLineEndings(mode) => self.set_line_endings(mode),
             Action::CopyDiagnostics => self.copy_diagnostics(),
-            Action::SetCommitAuthor { name, email } => self.set_commit_author(name, email),
+            Action::SetCommitAuthor { name, email } => self.set_commit_author(
+                name,
+                email,
+                "Commit author saved for this repository".to_owned(),
+            ),
+            Action::UseIdentity(index) => self.use_identity(index),
+            Action::UseGlobalIdentity => self.use_global_identity(),
+            Action::EditIdentity(index) => self.edit_identity(index),
+            Action::SaveIdentity { index, identity } => self.save_identity(index, identity),
+            Action::RemoveIdentity(index) => self.remove_identity(index),
             Action::ManageCredentials => {
                 if let Err(error) = platform::open_credential_manager() {
                     self.error_toast("Couldn't open Credential Manager", Some(error.to_string()));

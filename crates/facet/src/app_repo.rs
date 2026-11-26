@@ -1140,6 +1140,15 @@ impl FacetApp {
                 name: prompt.value(0),
                 email: prompt.value(1),
             },
+            PromptKind::Identity { index } => Action::SaveIdentity {
+                index: *index,
+                identity: crate::settings::SavedIdentity {
+                    label: prompt.value(0),
+                    name: prompt.value(1),
+                    email: prompt.value(2),
+                    hosts: crate::identities::parse_hosts(&prompt.value(3)),
+                },
+            },
             PromptKind::LfsTrack => Action::CreateLfsTrack {
                 pattern: prompt.value(0),
                 lockable: prompt.checked(),

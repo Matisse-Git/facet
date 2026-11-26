@@ -97,6 +97,11 @@ pub mod icon {
     pub const STASH: char = '\u{E7B8}';
     /// Library: the Submodules section.
     pub const SUBMODULE: char = '\u{E8F1}';
+    /// Contact: the commit author.
+    pub const PERSON: char = '\u{E77B}';
+    /// Warning (a triangle).
+    pub const WARNING: char = '\u{E7BA}';
+    pub const EDIT: char = '\u{E70F}';
 }
 
 const FAMILY_SEMIBOLD: &str = "facet-semibold";

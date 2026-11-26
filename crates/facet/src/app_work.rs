@@ -72,6 +72,10 @@ pub enum WorkEvent {
         result: Result<UndoEntry, GitError>,
     },
     AmendMessage(Result<Option<String>, GitError>),
+    /// The last commit's author, for amending.
+    AmendAuthor(Option<(String, String)>),
+    /// Who commits are made as in this repository.
+    Identity(Result<facet_git::Identity, GitError>),
     Perf(Result<PerfConfig, GitError>),
     PerfSet {
         enabled: bool,
@@ -217,6 +221,21 @@ impl FacetApp {
             WorkEvent::UndoList(facet_git::list_undo(&undo_info).await)
         });
         self.request_status(index, true);
+        self.request_identity(index);
+    }
+
+    /// Re-read who commits are made as in a tab (its own config over the global one).
+    pub(crate) fn request_identity(&self, index: usize) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let Some(root) = ready_info(tab).map(|info| info.root().to_owned()) else {
+            return;
+        };
+        let git = self.git.clone();
+        self.spawn_work(tab, false, async move {
+            WorkEvent::Identity(facet_git::identity(&git, Some(&root)).await)
+        });
     }
 
     // ----- status -----------------------------------------------------------------------------
@@ -898,12 +917,23 @@ impl FacetApp {
                 draft.message.clear();
             }
             draft.amend_original = None;
+            draft.amend_author = None;
             return;
         }
         let git = self.git.clone();
         let tab = &self.tabs[index];
+        let author_info = info.clone();
+        let author_git = git.clone();
         self.spawn_work(tab, false, async move {
             WorkEvent::AmendMessage(facet_git::last_commit_message(&git, info.root()).await)
+        });
+        self.spawn_work(tab, false, async move {
+            WorkEvent::AmendAuthor(
+                facet_git::last_commit_author(&author_git, author_info.root())
+                    .await
+                    .ok()
+                    .flatten(),
+            )
         });
     }
 
@@ -979,6 +1009,7 @@ impl FacetApp {
                         draft.message.clear();
                         draft.amend = false;
                         draft.amend_original = None;
+                        draft.amend_author = None;
                         draft.error = None;
                         let verb = if amend { "Amended" } else { "Committed" };
                         self.info_toast(format!("{verb}: {subject}"));
@@ -1039,6 +1070,16 @@ impl FacetApp {
                     }
                     draft.amend_original = Some(message);
                 }
+            }
+            WorkEvent::AmendAuthor(author) => {
+                let draft = &mut self.tabs[index].work.commit;
+                if draft.amend {
+                    draft.amend_author = author;
+                }
+            }
+            WorkEvent::Identity(result) => {
+                // A failed read shows as "not set" rather than hiding the line.
+                self.tabs[index].work.identity = Some(result.unwrap_or_default());
             }
             WorkEvent::Perf(result) => {
                 if let Ok(config) = result {

@@ -143,6 +143,22 @@ pub struct Identity {
     /// `global`, `local`, `system`… (from `git config --show-scope`) of the name; empty when
     /// it is not set anywhere.
     pub scope: String,
+    /// The same for the email.
+    pub email_scope: String,
+}
+
+impl Identity {
+    /// Neither a name nor an email is set: git refuses to commit.
+    pub fn is_unset(&self) -> bool {
+        self.name.is_empty() && self.email.is_empty()
+    }
+
+    /// The repository (or worktree) sets the name or email itself, over the global config.
+    pub fn is_repo_override(&self) -> bool {
+        [self.scope.as_str(), self.email_scope.as_str()]
+            .iter()
+            .any(|scope| matches!(*scope, "local" | "worktree"))
+    }
 }
 
 /// The commit author git uses in `root` (or outside any repository).
@@ -168,6 +184,35 @@ pub async fn identity(git: &Git, root: Option<&Path>) -> Result<Identity, GitErr
             identity.scope = scope.to_owned();
         } else {
             identity.email = value.to_owned();
+            identity.email_scope = scope.to_owned();
+        }
+    }
+    Ok(identity)
+}
+
+/// The commit author in the user's global Git config only (`git config --global`), whatever
+/// folder Facet runs in.
+pub async fn global_identity(git: &Git) -> Result<Identity, GitError> {
+    let mut identity = Identity::default();
+    for key in ["user.name", "user.email"] {
+        let output = git
+            .command(["config", "--global", "--get", key])
+            .background()
+            .output()
+            .await?;
+        // Exit status 1: not set.
+        if !output.success() {
+            continue;
+        }
+        let value = String::from_utf8_lossy(&output.stdout)
+            .trim_end_matches(['\r', '\n'])
+            .to_owned();
+        if key == "user.name" {
+            identity.name = value;
+            identity.scope = "global".to_owned();
+        } else {
+            identity.email = value;
+            identity.email_scope = "global".to_owned();
         }
     }
     Ok(identity)
@@ -185,6 +230,27 @@ pub async fn set_local_identity(
             .current_dir(root)
             .run()
             .await?;
+    }
+    Ok(())
+}
+
+/// Remove this repository's own author (`git config --local --unset`), so the global one
+/// applies again. Keys that are not set are skipped.
+pub async fn unset_local_identity(git: &Git, root: &Path) -> Result<(), GitError> {
+    for key in ["user.name", "user.email"] {
+        let output = git
+            .command(["config", "--local", "--unset-all", key])
+            .current_dir(root)
+            .output()
+            .await?;
+        // Exit status 5: the key was not set.
+        if !output.success() && output.status != 5 {
+            return Err(GitError::Failed {
+                command: format!("git config --local --unset-all {key}"),
+                code: output.status,
+                stderr: output.stderr_text(),
+            });
+        }
     }
     Ok(())
 }

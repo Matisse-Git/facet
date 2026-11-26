@@ -19,7 +19,7 @@ use crate::actions::{shortcut, Action};
 use crate::app::FacetApp;
 use crate::app_trees::LfsState;
 use crate::history::View;
-use crate::settings::{Settings, CHANGES_WIDTH, COMMIT_BOX_HEIGHT};
+use crate::settings::{SavedIdentity, Settings, CHANGES_WIDTH, COMMIT_BOX_HEIGHT};
 use crate::theme::{self, icon, radius, space, Palette};
 use crate::workspace::{Area, Included, Workspace};
 
@@ -145,6 +145,7 @@ impl FacetApp {
         let Some(index) = self.active.filter(|_| self.active_work().is_some()) else {
             return;
         };
+        let author = author_line(&self.tabs[index], &self.settings.identities);
         let tab = &mut self.tabs[index];
         let lfs = &tab.lfs;
         let work = &mut tab.work;
@@ -173,7 +174,7 @@ impl FacetApp {
             perf_offer(ui, offer_rect, galley, actions);
         }
         widgets::hairline_h(ui, rect.x_range().into(), commit.top());
-        commit_box(ui, commit, work, can_commit, actions);
+        commit_box(ui, commit, work, &author, can_commit, actions);
 
         // Splitter between the list and the commit box.
         let grab = Rect::from_min_max(
@@ -898,6 +899,361 @@ fn field_frame(ui: &Ui, rect: Rect, id: Id) {
     );
 }
 
+/// Height of the "committing as" line at the top of the composer.
+const AUTHOR_HEIGHT: f32 = 22.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tone {
+    Normal,
+    Warning,
+    Danger,
+}
+
+/// The "committing as" line: who the commit's author will be, and how that fits the
+/// repository.
+struct AuthorLine {
+    /// The config is still being read.
+    loading: bool,
+    /// `name <email>`, or what is wrong.
+    text: String,
+    /// The saved identity's label and where the author is set: `Work · global`.
+    tag: String,
+    tone: Tone,
+    /// The hover text: the whole story.
+    note: String,
+    /// The one-click fix: its label and action (`None`: open the menu).
+    fix: Option<(String, Option<Action>)>,
+    /// The saved identities for the menu: label, `name <email>`, active.
+    choices: Vec<(String, String, bool)>,
+    /// The repository sets its own author (so "use the global identity" can undo it).
+    repo_override: bool,
+}
+
+/// `this repo`, `global`… for where an author is set.
+fn author_place(identity: &facet_git::Identity) -> &'static str {
+    if identity.is_repo_override() {
+        return "this repo";
+    }
+    let scope = if identity.scope.is_empty() {
+        &identity.email_scope
+    } else {
+        &identity.scope
+    };
+    match scope.as_str() {
+        "global" => "global",
+        "system" => "system",
+        _ => "git config",
+    }
+}
+
+/// What the "committing as" line shows for a tab.
+fn author_line(tab: &crate::app::RepoTab, identities: &[SavedIdentity]) -> AuthorLine {
+    let work = &tab.work;
+    let mut line = AuthorLine {
+        loading: work.identity.is_none(),
+        text: "Reading your Git identity…".to_owned(),
+        tag: String::new(),
+        tone: Tone::Normal,
+        note: String::new(),
+        fix: None,
+        choices: Vec::new(),
+        repo_override: false,
+    };
+    let Some(current) = &work.identity else {
+        return line;
+    };
+    let active = crate::identities::find(identities, &current.name, &current.email);
+    line.choices = identities
+        .iter()
+        .enumerate()
+        .map(|(index, saved)| {
+            (
+                saved.label.clone(),
+                format!("{} <{}>", saved.name, saved.email),
+                Some(index) == active,
+            )
+        })
+        .collect();
+    line.repo_override = current.is_repo_override();
+    if current.is_unset() {
+        line.text = "No author set: Git will refuse to commit".to_owned();
+        line.tone = Tone::Danger;
+        line.note = "Git needs a name and email for every commit. Click to choose who you \
+                     commit as in this repository."
+            .to_owned();
+        return line;
+    }
+    let who = |name: &str, email: &str| format!("{name} <{email}>");
+    let label_of = |name: &str, email: &str| {
+        crate::identities::find(identities, name, email)
+            .map(|index| identities[index].label.clone())
+    };
+
+    // Amending keeps the last commit's author; only the committer becomes the current one.
+    let amending = work
+        .commit
+        .amend
+        .then_some(work.commit.amend_author.as_ref())
+        .flatten();
+    let (name, email) = match amending {
+        Some((name, email)) => (name.as_str(), email.as_str()),
+        None => (current.name.as_str(), current.email.as_str()),
+    };
+    line.text = who(name, email);
+    let label = label_of(name, email);
+    line.tag = match (&label, amending) {
+        (Some(label), Some(_)) => format!("{label} · kept by amend"),
+        (None, Some(_)) => "kept by amend".to_owned(),
+        (Some(label), None) => format!("{label} · {}", author_place(current)),
+        (None, None) => author_place(current).to_owned(),
+    };
+    line.note = match amending {
+        Some(_) => format!("Amending keeps the last commit's author, {}.", who(name, email)),
+        None => format!(
+            "Committing as {} (from {}). Click to change.",
+            who(name, email),
+            match author_place(current) {
+                "this repo" => "this repository's own Git config",
+                "global" => "your global Git config",
+                "system" => "the system Git config",
+                _ => "your Git config",
+            }
+        ),
+    };
+    if amending.is_some()
+        && !(name == current.name && email.eq_ignore_ascii_case(&current.email))
+    {
+        line.tone = Tone::Warning;
+        line.note.push_str(&format!(
+            " That is not you: {} is only recorded as the committer.",
+            who(&current.name, &current.email)
+        ));
+    }
+
+    let host = crate::identities::repository_host(&tab.refs.snapshot.remotes);
+    if let crate::identities::Standing::WrongHost { host, owners } =
+        crate::identities::standing(identities, name, email, host.as_deref())
+    {
+        line.tone = Tone::Warning;
+        let owner_labels: Vec<&str> = owners
+            .iter()
+            .map(|index| identities[*index].label.as_str())
+            .collect();
+        line.note = format!(
+            "This repository is on {host}, which is for {}, but {} {}.",
+            owner_labels.join(" or "),
+            if amending.is_some() {
+                "the amended commit keeps the author"
+            } else {
+                "you're committing as"
+            },
+            label.clone().unwrap_or_else(|| who(name, email)),
+        );
+        if amending.is_none() {
+            line.fix = Some(match owners.as_slice() {
+                [only] => (
+                    format!("Use {}", identities[*only].label),
+                    Some(Action::UseIdentity(*only)),
+                ),
+                _ => ("Choose…".to_owned(), None),
+            });
+        }
+    }
+    line
+}
+
+/// The "committing as" line; a click opens the menu of saved identities.
+fn author_row(ui: &Ui, rect: Rect, line: &AuthorLine, actions: &mut Vec<Action>) {
+    let palette = Palette::of(ui.ctx());
+    let center = rect.center().y;
+    let tone_color = match line.tone {
+        Tone::Normal => palette.text_tertiary,
+        Tone::Warning => palette.warning,
+        Tone::Danger => palette.danger,
+    };
+    let response = ui.interact(rect, Id::unique("commit-author"), Sense::click());
+    let fill = widgets::interaction_fill(ui, &response, palette);
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(radius::S), fill);
+    if line.tone != Tone::Normal {
+        ui.painter().rect_filled(
+            rect,
+            CornerRadius::same(radius::S),
+            theme::fade(tone_color, 0.10),
+        );
+    }
+    widgets::focus_ring(ui, &response, rect, radius::S, palette);
+
+    let glyph = if line.tone == Tone::Normal {
+        icon::PERSON
+    } else {
+        icon::WARNING
+    };
+    ui.painter().text(
+        Pos2::new(rect.left() + 11.0, center),
+        Align2::CENTER_CENTER,
+        glyph,
+        theme::icon_font(12.0),
+        tone_color,
+    );
+
+    // The fix button and the tag on the right, the author filling the rest.
+    let mut right = rect.right() - 4.0;
+    let mut fix_clicked = false;
+    if let Some((label, action)) = &line.fix {
+        let width = text_button_width(ui, label);
+        let button = Rect::from_min_max(
+            Pos2::new(right - width, rect.top() + 1.0),
+            Pos2::new(right, rect.bottom() - 1.0),
+        );
+        if text_button_at(
+            ui,
+            button,
+            Id::unique("commit-author-fix"),
+            label,
+            &line.note,
+            palette.warning,
+            false,
+        )
+        .clicked()
+        {
+            match action {
+                Some(action) => actions.push(action.clone()),
+                None => fix_clicked = true,
+            }
+        }
+        right = button.left() - space::S;
+    }
+    let text_left = rect.left() + 24.0;
+    if !line.tag.is_empty() {
+        let max = ((right - text_left) * 0.45).max(0.0);
+        let galley = ui
+            .painter()
+            .layout_no_wrap(line.tag.clone(), theme::small(), palette.text_tertiary);
+        let width = galley.size().x.min(max);
+        text_line(
+            ui,
+            Pos2::new(right - width, center),
+            &line.tag,
+            theme::small(),
+            palette.text_tertiary,
+            max,
+        );
+        right -= width + space::S;
+    }
+    text_line(
+        ui,
+        Pos2::new(text_left, center),
+        &line.text,
+        theme::small(),
+        match line.tone {
+            Tone::Danger => palette.danger,
+            _ if line.loading => palette.text_tertiary,
+            _ => palette.text_secondary,
+        },
+        (right - text_left).max(0.0),
+    );
+
+    let response = if line.note.is_empty() {
+        response
+    } else {
+        response.on_hover_text(&line.note)
+    };
+    let popup_id = egui::Popup::default_response_id(&response);
+    if fix_clicked {
+        egui::Popup::open_id(ui.ctx(), popup_id);
+    }
+    if line.loading {
+        return;
+    }
+    let menu_width = rect.width().clamp(240.0, 340.0);
+    egui::Popup::menu(&response)
+        .id(popup_id)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .align(egui::RectAlign::BOTTOM_START)
+        .gap(space::XS)
+        .width(menu_width)
+        .show(|ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            ui.set_width(menu_width - 12.0);
+            for (index, (label, who, active)) in line.choices.iter().enumerate() {
+                let (row, item) = ui.allocate_exact_size(
+                    Vec2::new(ui.available_width(), 40.0),
+                    Sense::click(),
+                );
+                let fill = widgets::interaction_fill(ui, &item, palette);
+                ui.painter()
+                    .rect_filled(row, CornerRadius::same(radius::M), fill);
+                if *active {
+                    ui.painter().rect_filled(
+                        Rect::from_center_size(
+                            Pos2::new(row.left() + 1.5, row.center().y),
+                            Vec2::new(3.0, 16.0),
+                        ),
+                        CornerRadius::same(2),
+                        palette.accent,
+                    );
+                    ui.painter().text(
+                        Pos2::new(row.right() - 14.0, row.center().y),
+                        Align2::CENTER_CENTER,
+                        icon::CHECK,
+                        theme::icon_font(12.0),
+                        palette.accent,
+                    );
+                }
+                let width = row.width() - 12.0 - 32.0;
+                text_line(
+                    ui,
+                    Pos2::new(row.left() + 12.0, row.top() + 13.0),
+                    label,
+                    if *active {
+                        theme::strong()
+                    } else {
+                        theme::body()
+                    },
+                    palette.text,
+                    width,
+                );
+                text_line(
+                    ui,
+                    Pos2::new(row.left() + 12.0, row.bottom() - 11.0),
+                    who,
+                    theme::small(),
+                    palette.text_tertiary,
+                    width,
+                );
+                if item.clicked() {
+                    if !*active {
+                        actions.push(Action::UseIdentity(index));
+                    }
+                    ui.close();
+                }
+            }
+            if !line.choices.is_empty() {
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
+            }
+            ui.spacing_mut().item_spacing.y = 2.0;
+            if line.repo_override {
+                super::history::menu_item(
+                    ui,
+                    "Use Global Identity",
+                    Action::UseGlobalIdentity,
+                    actions,
+                );
+            }
+            super::history::menu_item(
+                ui,
+                "Custom for This Repository…",
+                Action::EditCommitAuthor,
+                actions,
+            );
+            super::history::menu_item(ui, "Add Identity…", Action::EditIdentity(None), actions);
+            super::history::menu_item(ui, "Manage Identities…", Action::ShowSettings, actions);
+        });
+}
+
 /// The composer: summary, description, the amend switch with the summary's length, and the
 /// commit button. A rejected commit shows git's and the hooks' output above it.
 #[allow(clippy::too_many_lines)]
@@ -905,11 +1261,18 @@ fn commit_box(
     ui: &mut Ui,
     rect: Rect,
     work: &mut Workspace,
+    author: &AuthorLine,
     can_commit: bool,
     actions: &mut Vec<Action>,
 ) {
     let palette = Palette::of(ui.ctx());
     let inner = rect.shrink(12.0);
+    // Who the commit is made as, above everything else.
+    let author_rect = Rect::from_min_size(
+        Pos2::new(inner.left(), rect.top() + 8.0),
+        Vec2::new(inner.width(), AUTHOR_HEIGHT),
+    );
+    author_row(ui, author_rect, author, actions);
     let has_commit = work.branch.oid.is_some();
     let branch = work.branch.head.clone();
     let staged = work.staged.len();
@@ -923,7 +1286,7 @@ fn commit_box(
         Pos2::new(inner.left() + 2.0, button.top() - gap - 18.0),
         Pos2::new(inner.right() - 2.0, button.top() - gap),
     );
-    let mut top = inner.top();
+    let mut top = author_rect.bottom() + 6.0;
 
     if let Some(error) = draft.error.clone() {
         let room = options.top() - gap - FIELD_HEIGHT - gap - 40.0 - gap - top;

@@ -22,6 +22,7 @@ mod highlight;
 mod history;
 mod icon;
 mod icon_art;
+mod identities;
 mod instance;
 mod integrations;
 mod loader;

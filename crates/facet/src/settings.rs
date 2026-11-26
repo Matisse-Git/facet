@@ -19,7 +19,7 @@ const MAX_RECENT: usize = 12;
 pub const SIDEBAR_WIDTH: std::ops::RangeInclusive<f32> = 176.0..=480.0;
 pub const COMMAND_LOG_HEIGHT: std::ops::RangeInclusive<f32> = 96.0..=640.0;
 pub const CHANGES_WIDTH: std::ops::RangeInclusive<f32> = 240.0..=720.0;
-pub const COMMIT_BOX_HEIGHT: std::ops::RangeInclusive<f32> = 178.0..=480.0;
+pub const COMMIT_BOX_HEIGHT: std::ops::RangeInclusive<f32> = 204.0..=480.0;
 pub const DETAIL_WIDTH: std::ops::RangeInclusive<f32> = 320.0..=1200.0;
 /// Sidebar sections that can be collapsed (by their title).
 pub const SIDEBAR_SECTIONS: [&str; 7] = [
@@ -282,6 +282,22 @@ pub struct Settings {
     pub default_branch: String,
     pub editor: Editor,
     pub terminal: Terminal,
+    /// Commit authors to pick from per repository (written to its own Git config).
+    pub identities: Vec<SavedIdentity>,
+    /// The first identity was taken from the global Git config already (it is not offered
+    /// again after the list is emptied).
+    pub identities_seeded: bool,
+}
+
+/// A commit author kept in Facet, e.g. "Work" or "GitHub".
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SavedIdentity {
+    pub label: String,
+    pub name: String,
+    pub email: String,
+    /// Remote hosts this identity is for (`github.com`, `*.example.co.jp`, an SSH alias).
+    pub hosts: Vec<String>,
 }
 
 /// An external diff and/or merge tool for some file extensions. Commands are command lines
@@ -352,7 +368,7 @@ impl Default for Settings {
             command_log_visible: false,
             command_log_height: 200.0,
             changes_width: 340.0,
-            commit_box_height: 214.0,
+            commit_box_height: 240.0,
             image_mode: ImageMode::default(),
             detail_width: 520.0,
             pull_mode: PullMode::default(),
@@ -376,6 +392,8 @@ impl Default for Settings {
             default_branch: "main".to_owned(),
             editor: Editor::default(),
             terminal: Terminal::default(),
+            identities: Vec::new(),
+            identities_seeded: false,
         }
     }
 }
@@ -454,9 +472,9 @@ impl Settings {
         self.changes_width = clamp_or(self.changes_width, CHANGES_WIDTH, 340.0);
         // Composers sized for the old, single-field commit box get the new default.
         if self.commit_box_height < *COMMIT_BOX_HEIGHT.start() {
-            self.commit_box_height = 214.0;
+            self.commit_box_height = 240.0;
         }
-        self.commit_box_height = clamp_or(self.commit_box_height, COMMIT_BOX_HEIGHT, 214.0);
+        self.commit_box_height = clamp_or(self.commit_box_height, COMMIT_BOX_HEIGHT, 240.0);
         self.detail_width = clamp_or(self.detail_width, DETAIL_WIDTH, 520.0);
         self.ui_scale = clamp_or(self.ui_scale, UI_SCALE, 1.0);
         self.code_font_size = clamp_or(self.code_font_size, 10.0..=20.0, 13.0);

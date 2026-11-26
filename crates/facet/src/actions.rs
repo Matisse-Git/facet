@@ -381,6 +381,17 @@ pub enum Action {
         name: String,
         email: String,
     },
+    /// Commit as saved identity `n` in the active repository (written to its own config).
+    UseIdentity(usize),
+    /// Remove the active repository's own author, so the global one applies again.
+    UseGlobalIdentity,
+    /// Ask for a new saved identity (`None`) or edit one.
+    EditIdentity(Option<usize>),
+    SaveIdentity {
+        index: Option<usize>,
+        identity: crate::settings::SavedIdentity,
+    },
+    RemoveIdentity(usize),
     /// How the active repository converts line endings (`core.autocrlf`, repo-local).
     SetLineEndings(facet_git::LineEndings),
     /// Copy versions and paths for a bug report.
