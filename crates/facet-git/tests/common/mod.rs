@@ -22,6 +22,18 @@ pub struct TestRepo {
     pub log: Arc<CommandLog>,
 }
 
+/// `dir` with every component spelled out. The temp directory can be an 8.3 short path (GitHub's
+/// Windows runners use `C:\Users\RUNNER~1\...`), while git reports the long one, so paths
+/// compared with git's output must be long too. Drops the `\\?\` prefix `canonicalize` adds.
+fn long_path(dir: &Path) -> PathBuf {
+    let canonical = std::fs::canonicalize(dir).expect("canonicalize temp dir");
+    let text = canonical.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC") => PathBuf::from(rest),
+        _ => canonical,
+    }
+}
+
 /// A `Git` that ignores the user's global/system config and uses a fixed identity.
 pub fn isolated_git(scratch: &Path) -> (Git, Arc<CommandLog>) {
     let global = scratch.join("global.gitconfig");
@@ -43,8 +55,9 @@ impl TestRepo {
     /// An empty temp directory that is *not* a repository.
     pub fn empty_dir() -> Self {
         let temp = tempfile::tempdir().expect("create temp dir");
-        let scratch = temp.path().join("scratch");
-        let path = temp.path().join("work");
+        let root = long_path(temp.path());
+        let scratch = root.join("scratch");
+        let path = root.join("work");
         std::fs::create_dir_all(&scratch).expect("create scratch dir");
         std::fs::create_dir_all(&path).expect("create work dir");
         let (git, log) = isolated_git(&scratch);
