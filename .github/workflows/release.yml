@@ -1,0 +1,79 @@
+# Builds Facet's installer on GitHub and publishes it as a GitHub Release.
+#
+# Normally started by pushing a version tag (scripts\release.ps1 does that). It can also be
+# run by hand from the Actions tab for a tag that already exists, for example to rebuild a
+# release whose run failed; the release's files are then replaced.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and release (for example v0.1.0)
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: refs/tags/${{ env.TAG }}
+
+      - name: Check the tag matches the version in Cargo.toml
+        shell: pwsh
+        run: |
+          $toml = Get-Content Cargo.toml -Raw
+          if ($toml -notmatch '(?ms)^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"') {
+              throw 'Could not read the version from Cargo.toml [workspace.package].'
+          }
+          $version = $Matches[1]
+          if ($env:TAG -ne "v$version") {
+              throw "Tag $env:TAG does not match Cargo.toml version $version (expected v$version)."
+          }
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run the tests
+        run: cargo test --workspace --locked
+
+      - name: Build the installer
+        shell: pwsh
+        run: ./scripts/build-installer.ps1
+
+      - name: Write the checksum
+        shell: pwsh
+        run: |
+          $name = "Facet-Setup-$env:VERSION.exe"
+          $hash = (Get-FileHash "target/installer/$name" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $name" | Out-File -FilePath "target/installer/$name.sha256" -Encoding ascii -NoNewline
+
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $files = "target/installer/Facet-Setup-$env:VERSION.exe", "target/installer/Facet-Setup-$env:VERSION.exe.sha256"
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+              gh release upload $env:TAG @files --clobber
+          } else {
+              gh release create $env:TAG @files --title "Facet $env:VERSION" --generate-notes --verify-tag
+          }
+          if ($LASTEXITCODE -ne 0) { throw "Publishing the release failed (exit code $LASTEXITCODE)." }
