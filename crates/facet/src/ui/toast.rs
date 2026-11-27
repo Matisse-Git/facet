@@ -27,8 +27,9 @@ pub struct Toast {
     pub kind: ToastKind,
     pub title: String,
     pub detail: Option<String>,
-    /// An optional button: its label and what it does ("Undo").
-    pub action: Option<(String, Action)>,
+    /// Buttons: label and what each does ("Undo"). One sits beside the title; more get a row
+    /// of their own under the text.
+    pub actions: Vec<(String, Action)>,
     created: Instant,
     dismissed: bool,
 }
@@ -40,7 +41,7 @@ impl Toast {
             kind,
             title,
             detail,
-            action: None,
+            actions: Vec::new(),
             created: Instant::now(),
             dismissed: false,
         }
@@ -53,7 +54,7 @@ impl Toast {
     fn lifetime(&self) -> Duration {
         match self.kind {
             // An offer needs time to be read and reached.
-            ToastKind::Info if self.action.is_some() => Duration::from_secs(8),
+            ToastKind::Info if !self.actions.is_empty() => Duration::from_secs(8),
             ToastKind::Info => Duration::from_millis(3500),
             ToastKind::Error => Duration::from_secs(12),
         }
@@ -86,11 +87,19 @@ impl FacetApp {
         // Newest toast sits at the bottom of the stack.
         for toast in self.toasts.iter().rev() {
             let remaining = toast.remaining();
-            let action_width = toast
-                .action
-                .as_ref()
-                .map_or(0.0, |(label, _)| text_button_width(ui, label) + space::S);
-            let text_width = width - text_left_inset - space::S - 28.0 - space::S - action_width;
+            // A single button sits beside the title; several get a row under the text.
+            let button_row = toast.actions.len() > 1;
+            let action_widths: Vec<f32> = toast
+                .actions
+                .iter()
+                .map(|(label, _)| text_button_width(ui, label) + space::S)
+                .collect();
+            let inline_width = if button_row {
+                0.0
+            } else {
+                action_widths.iter().sum()
+            };
+            let text_width = width - text_left_inset - space::S - 28.0 - space::S - inline_width;
             let visible = ctx.animate_bool_with_time_and_easing(
                 Id::unique(("toast-visible", toast.id)),
                 remaining.is_some(),
@@ -129,7 +138,8 @@ impl FacetApp {
             let text_height = title.size().y
                 + detail
                     .as_ref()
-                    .map_or(0.0, |detail| space::XS + detail.size().y);
+                    .map_or(0.0, |detail| space::XS + detail.size().y)
+                + if button_row { space::S + 24.0 } else { 0.0 };
             let height =
                 (text_height + space::M + space::XS * 2.0).max(theme::ROW_HEIGHT + space::S);
 
@@ -203,15 +213,24 @@ impl FacetApp {
                         dismiss.push(toast.id);
                     }
 
-                    if let Some((label, action)) = &toast.action {
+                    // Buttons right to left: beside the close button, or along the bottom.
+                    let (mut right, center_y) = if button_row {
+                        (rect.right(), rect.bottom() - space::S - space::XS - 12.0)
+                    } else {
+                        (close.left(), close.center().y)
+                    };
+                    for (index, ((label, action), action_width)) in
+                        toast.actions.iter().zip(&action_widths).enumerate().rev()
+                    {
                         let button = Rect::from_min_size(
-                            Pos2::new(close.left() - action_width, close.center().y - 12.0),
+                            Pos2::new(right - action_width, center_y - 12.0),
                             Vec2::new(action_width - space::S, 24.0),
                         );
+                        right -= action_width;
                         if text_button_at(
                             ui,
                             button,
-                            Id::unique(("toast-action", toast.id)),
+                            Id::unique(("toast-action", toast.id, index)),
                             label,
                             "",
                             palette.accent,

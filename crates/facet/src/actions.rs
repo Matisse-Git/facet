@@ -46,7 +46,28 @@ pub enum Action {
     /// else fetch.
     Sync,
     OpenPath(PathBuf),
-    ForgetRecent(PathBuf),
+    /// Take a repository off Facet's lists at once (closing its tab); the folder is not
+    /// touched. The toast offers Undo and the Recycle Bin.
+    RemoveRepository(PathBuf),
+    /// Undo of [`Action::RemoveRepository`]: back into the recent list at `recent`, and into a
+    /// tab at position `tab` (made active again when it was).
+    RestoreRepository {
+        path: PathBuf,
+        recent: Option<usize>,
+        tab: Option<usize>,
+        active: bool,
+    },
+    /// The Remove Repository dialog for the active repository.
+    ShowRemoveActiveRepository,
+    /// The Remove Repository dialog, with "Also move the folder to the Recycle Bin" ticked
+    /// (`recycle`) or not.
+    ShowRemoveRepository {
+        path: PathBuf,
+        recycle: bool,
+    },
+    ToggleRemoveRecycle,
+    ConfirmRemoveRepository,
+    CloseRemoveRepository,
     CloseTab(usize),
     CloseActiveTab,
     NextTab,
@@ -678,6 +699,11 @@ pub fn commands(cx: &CommandContext<'_>) -> Vec<Command> {
             "Close Tab".into(),
             Some(shortcut::CLOSE_TAB),
             Action::CloseActiveTab,
+        );
+        add(
+            "Remove Repository…".into(),
+            None,
+            Action::ShowRemoveActiveRepository,
         );
     }
     if cx.tabs.len() > 1 {

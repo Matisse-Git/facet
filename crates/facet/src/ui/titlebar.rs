@@ -9,6 +9,7 @@ use eframe::egui::{
 };
 use facet_git::parse::{GitRef, RefKind};
 use facet_git::Head;
+use std::path::PathBuf;
 use std::time::SystemTime;
 
 use super::sidebar;
@@ -27,6 +28,8 @@ const SEARCH_WIDTH: f32 = 400.0;
 const SWITCHER_WIDTH: f32 = 440.0;
 const BRANCH_PICKER_WIDTH: f32 = 380.0;
 const REPO_ROW: f32 = 52.0;
+/// The × that removes a repository from a switcher row.
+const REMOVE_SIZE: f32 = 28.0;
 /// A strip of title bar that is always left empty so the window can be grabbed.
 const DRAG_STRIP: f32 = space::XL;
 
@@ -259,13 +262,15 @@ impl FacetApp {
     /// The flyout under the repository button: find, switch, reopen, add.
     fn repo_switcher(&mut self, button: &egui::Response) {
         let mut chosen = None;
+        // Removing keeps the flyout open, so several stale entries can go in a row.
+        let mut removed = None;
         let open_paths: Vec<_> = self.tabs.iter().map(|tab| tab.path.clone()).collect();
         let recent: Vec<_> = self
             .settings
             .recent_repos
             .iter()
             .filter(|path| !open_paths.iter().any(|open| same_path(open, path)))
-            .cloned()
+            .map(|path| (path.clone(), self.recent_health.of(path)))
             .collect();
         let active = self.active;
         let tabs: Vec<(String, String, String, bool)> = self
@@ -356,7 +361,8 @@ impl FacetApp {
                             let row = rect.shrink2(Vec2::new(space::XS, 2.0));
                             let response =
                                 list_row(ui, row, Id::unique(("switch-tab", index)), current);
-                            repo_row_text(ui, row, name, path, detail, *ready, palette);
+                            let hovered = ui.rect_contains_pointer(row);
+                            repo_row_text(ui, row, name, path, detail, *ready, hovered, palette);
                             let action = Action::SwitchTab(index);
                             first_match.get_or_insert_with(|| action.clone());
                             if response.clicked() {
@@ -365,15 +371,21 @@ impl FacetApp {
                             if response.middle_clicked() {
                                 chosen = Some(Action::CloseTab(index));
                             }
-                            response.context_menu(|ui| {
-                                if ui.button("Close").clicked() {
-                                    chosen = Some(Action::CloseTab(index));
-                                }
-                            });
+                            if hovered
+                                && remove_button(
+                                    ui,
+                                    row,
+                                    Id::unique(("switch-remove-tab", index)),
+                                    "Close and remove from Facet (the folder stays on disk)",
+                                )
+                                .clicked()
+                            {
+                                removed = Some(Action::RemoveRepository(PathBuf::from(path)));
+                            }
                         }
                         let shown: Vec<_> = recent
                             .iter()
-                            .filter(|path| {
+                            .filter(|(path, _)| {
                                 let name = repo_name(path);
                                 matches(&name, &path.display().to_string())
                             })
@@ -390,7 +402,7 @@ impl FacetApp {
                                 palette.text_tertiary,
                             );
                         }
-                        for path in shown {
+                        for (path, health) in shown {
                             let name = repo_name(path);
                             let (rect, _) = ui.allocate_exact_size(
                                 Vec2::new(row_width, REPO_ROW),
@@ -399,13 +411,15 @@ impl FacetApp {
                             let row = rect.shrink2(Vec2::new(space::XS, 2.0));
                             let response =
                                 list_row(ui, row, Id::unique(("switch-recent", path)), false);
+                            let hovered = ui.rect_contains_pointer(row);
                             repo_row_text(
                                 ui,
                                 row,
                                 &name,
                                 &path.display().to_string(),
-                                "",
-                                true,
+                                health.label().unwrap_or(""),
+                                health.label().is_none(),
+                                hovered,
                                 palette,
                             );
                             let action = Action::OpenPath(path.clone());
@@ -413,11 +427,17 @@ impl FacetApp {
                             if response.clicked() {
                                 chosen = Some(action);
                             }
-                            response.context_menu(|ui| {
-                                if ui.button("Remove from Recent").clicked() {
-                                    chosen = Some(Action::ForgetRecent(path.clone()));
-                                }
-                            });
+                            if hovered
+                                && remove_button(
+                                    ui,
+                                    row,
+                                    Id::unique(("switch-remove-recent", path)),
+                                    "Remove from Facet (the folder stays on disk)",
+                                )
+                                .clicked()
+                            {
+                                removed = Some(Action::RemoveRepository(path.clone()));
+                            }
                         }
                     });
                 if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
@@ -457,6 +477,7 @@ impl FacetApp {
                 }
             });
         self.pending.extend(chosen);
+        self.pending.extend(removed);
     }
 
     /// "⑂ main ⌄": opens the branch picker. Only for a ready working copy.
@@ -1076,6 +1097,17 @@ impl FacetApp {
 }
 
 /// A repository row in the switcher: monogram, name over path, and a detail on the right.
+/// The × at the right end of a hovered switcher row.
+fn remove_button(ui: &Ui, row: Rect, id: Id, tooltip: &str) -> egui::Response {
+    let rect = Rect::from_center_size(
+        Pos2::new(row.right() - space::S - REMOVE_SIZE / 2.0, row.center().y),
+        Vec2::splat(REMOVE_SIZE),
+    );
+    widgets::icon_button_at(ui, rect, id, icon::CLOSE, tooltip)
+}
+
+/// A hovered row (`removable`) keeps the right end free for its × button.
+#[allow(clippy::too_many_arguments)]
 fn repo_row_text(
     ui: &Ui,
     row: Rect,
@@ -1083,8 +1115,17 @@ fn repo_row_text(
     path: &str,
     detail: &str,
     ready: bool,
+    removable: bool,
     palette: &Palette,
 ) {
+    let row = if removable {
+        Rect::from_min_max(
+            row.min,
+            Pos2::new(row.right() - REMOVE_SIZE - space::XS, row.bottom()),
+        )
+    } else {
+        row
+    };
     let tile = Rect::from_min_size(
         Pos2::new(row.left() + space::S, row.center().y - 16.0),
         Vec2::splat(32.0),
@@ -1202,6 +1243,10 @@ impl FacetApp {
             ui.separator();
             if ui.button("Copy Path").clicked() {
                 chosen = Some(Action::CopyRepositoryPath);
+            }
+            ui.separator();
+            if ui.button("Remove Repository…").clicked() {
+                chosen = Some(Action::ShowRemoveActiveRepository);
             }
         });
         self.pending.extend(chosen);

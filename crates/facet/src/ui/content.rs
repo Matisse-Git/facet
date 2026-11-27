@@ -15,6 +15,7 @@ use super::widgets::{self, button, skeleton, text_line, ButtonKind};
 use crate::actions::{shortcut, Action};
 use crate::app::{FacetApp, TabState};
 use crate::app_add::AddTab;
+use crate::app_remove::RepoHealth;
 use crate::format::{relative_time, unix_seconds};
 use crate::theme::{self, icon, radius, space, Palette};
 
@@ -41,7 +42,15 @@ impl FacetApp {
         }
         let mut actions = Vec::new();
         match self.active_tab().map(|tab| &tab.state) {
-            None => welcome(ui, rect, &self.settings.recent_repos, &mut actions),
+            None => {
+                let recent: Vec<(PathBuf, RepoHealth)> = self
+                    .settings
+                    .recent_repos
+                    .iter()
+                    .map(|path| (path.clone(), self.recent_health.of(path)))
+                    .collect();
+                welcome(ui, rect, &recent, &mut actions);
+            }
             Some(TabState::Loading) => overview_skeleton(ui, rect),
             Some(TabState::Ready { info, head }) => overview(ui, rect, info, head, &mut actions),
         }
@@ -49,7 +58,7 @@ impl FacetApp {
     }
 }
 
-fn welcome(ui: &mut Ui, rect: Rect, recent: &[PathBuf], actions: &mut Vec<Action>) {
+fn welcome(ui: &mut Ui, rect: Rect, recent: &[(PathBuf, RepoHealth)], actions: &mut Vec<Action>) {
     let palette = Palette::of(ui.ctx());
     let width = (rect.width() - space::XL * 2.0).clamp(0.0, WELCOME_WIDTH);
     let recent_shown = recent.len().min(MAX_RECENT);
@@ -166,7 +175,7 @@ fn welcome(ui: &mut Ui, rect: Rect, recent: &[PathBuf], actions: &mut Vec<Action
             palette.hairline_stroke(),
             StrokeKind::Inside,
         );
-        for (index, path) in recent.iter().take(MAX_RECENT).enumerate() {
+        for (index, (path, health)) in recent.iter().take(MAX_RECENT).enumerate() {
             let row = Rect::from_min_size(
                 Pos2::new(card.left(), card.top() + index as f32 * RECENT_ROW),
                 Vec2::new(width, RECENT_ROW),
@@ -193,14 +202,40 @@ fn welcome(ui: &mut Ui, rect: Rect, recent: &[PathBuf], actions: &mut Vec<Action
                 Vec2::splat(36.0),
             );
             widgets::monogram(ui.painter(), tile, &name, palette);
+            let hovered = ui.rect_contains_pointer(row);
+            // Right end: "Folder missing" / "Not a repository", and the × while hovered.
+            let mut right = row.right() - space::M;
+            let remove =
+                Rect::from_center_size(Pos2::new(right - 14.0, row.center().y), Vec2::splat(28.0));
+            if hovered {
+                right = remove.left() - space::XS;
+            }
+            if let Some(label) = health.label() {
+                let galley = ui.painter().layout_no_wrap(
+                    label.to_owned(),
+                    theme::small(),
+                    palette.text_secondary,
+                );
+                right -= galley.size().x;
+                ui.painter().galley(
+                    Pos2::new(right, row.center().y - galley.size().y / 2.0),
+                    galley,
+                    palette.text_secondary,
+                );
+                right -= space::M;
+            }
             let text_left = tile.right() + space::M - space::XS;
-            let text_width = row.right() - space::XL - text_left;
+            let text_width = (right - space::S).min(row.right() - space::XL) - text_left;
             text_line(
                 ui,
                 Pos2::new(text_left, row.center().y - 9.0),
                 &name,
                 theme::strong(),
-                palette.text,
+                if health.label().is_none() {
+                    palette.text
+                } else {
+                    palette.text_tertiary
+                },
                 text_width,
             );
             text_line(
@@ -211,21 +246,30 @@ fn welcome(ui: &mut Ui, rect: Rect, recent: &[PathBuf], actions: &mut Vec<Action
                 palette.text_tertiary,
                 text_width,
             );
-            if response.hovered() {
-                ui.painter().text(
-                    Pos2::new(row.right() - space::M - 6.0, row.center().y),
-                    Align2::CENTER_CENTER,
-                    icon::CHEVRON_RIGHT,
-                    theme::icon_font(10.0),
-                    palette.text_secondary,
-                );
-            }
             if response.clicked() {
                 actions.push(Action::OpenPath(path.clone()));
             }
+            if hovered
+                && widgets::icon_button_at(
+                    ui,
+                    remove,
+                    Id::unique(("welcome-remove", index)),
+                    icon::CLOSE,
+                    "Remove from Facet (the folder stays on disk)",
+                )
+                .clicked()
+            {
+                actions.push(Action::RemoveRepository(path.clone()));
+            }
             response.context_menu(|ui| {
-                if ui.button("Remove from Recent").clicked() {
-                    actions.push(Action::ForgetRecent(path.clone()));
+                if ui.button("Remove from Facet").clicked() {
+                    actions.push(Action::RemoveRepository(path.clone()));
+                }
+                if health != &RepoHealth::Missing && ui.button("Remove Repository…").clicked() {
+                    actions.push(Action::ShowRemoveRepository {
+                        path: path.clone(),
+                        recycle: false,
+                    });
                 }
             });
         }

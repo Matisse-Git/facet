@@ -17,6 +17,7 @@ mod image_diff;
 pub mod palette;
 mod power;
 pub mod prompt;
+mod remove_repo;
 mod settings;
 pub(crate) use settings::version_label;
 mod sidebar;
@@ -216,6 +217,7 @@ impl FacetApp {
         self.rebase_layer(ui, window);
         self.conflict_layer(ui, window);
         self.add_repo_layer(ui, window);
+        self.remove_repo_layer(ui, window);
         self.confirm_layer(ui, window);
         self.prompt_layer(ui, window);
     }

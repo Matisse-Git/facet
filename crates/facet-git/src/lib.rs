@@ -32,6 +32,7 @@ mod patch;
 pub mod rebase;
 mod refs;
 mod remote;
+mod removal;
 mod repo;
 mod runner;
 mod stage;
@@ -80,6 +81,7 @@ pub use remote::{
     add_remote, fetch, fetch_in_background, pull, push, push_tag, remove_remote, restore_remote,
     Network, PullMode, PushRequest,
 };
+pub use removal::{removal_check, RemovalCheck};
 pub use repo::{commit_summary, discover, head, version, Head, RepoInfo};
 pub use runner::{Git, GitCommand, GitOutput, ProgressFn};
 pub use stage::{apply_patch, stage_all, stage_paths, unstage_all, unstage_paths, ApplyTo};

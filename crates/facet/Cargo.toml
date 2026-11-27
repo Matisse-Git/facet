@@ -36,6 +36,8 @@ windows = { version = "0.62", features = [
     "Win32_UI_Shell_Common",
     "Win32_UI_WindowsAndMessaging",
 ] }
+# `#[implement]` (the Recycle Bin progress sink) expands to paths in `windows_core`.
+windows-core = "0.62"
 
 [build-dependencies]
 embed-manifest = "1.5"

@@ -53,6 +53,8 @@ pub enum Event {
     Settings(SettingsEvent),
     /// The Add Repository dialog: folder picks, finished clones and inits (`app_add.rs`).
     AddRepo(crate::app_add::AddRepoEvent),
+    /// Removing repositories and the recent list's health (`app_remove.rs`).
+    Remove(crate::app_remove::RemoveEvent),
     /// Working copy results for one tab (see `app_work.rs`). `stamp` is the state of
     /// `.git/index` right after work that may have written it.
     Work {
@@ -164,6 +166,10 @@ pub struct FacetApp {
     pub add_view: Option<crate::app_add::AddRepoView>,
     /// The dialog's tab when it was last closed; it opens there again.
     pub(crate) last_add_tab: crate::app_add::AddTab,
+    /// The Remove Repository dialog, while open.
+    pub remove_view: Option<crate::app_remove::RemoveRepoView>,
+    /// Which recent folders are gone or no longer repositories.
+    pub(crate) recent_health: crate::app_remove::RecentHealth,
     /// Programs found on this machine (terminal, editors, diff / merge tools).
     pub(crate) installed: Installed,
     /// Credential prompts from git, oldest first; the first is shown once no other dialog is.
@@ -259,6 +265,8 @@ impl FacetApp {
             open_branches: false,
             add_view: None,
             last_add_tab: crate::app_add::AddTab::default(),
+            remove_view: None,
+            recent_health: crate::app_remove::RecentHealth::default(),
             installed: Installed::default(),
             askpass: VecDeque::new(),
             notified: false,
@@ -370,6 +378,7 @@ impl FacetApp {
             Event::Askpass(request) => self.askpass.push_back(request),
             Event::Settings(event) => self.handle_settings_event(event),
             Event::AddRepo(event) => self.handle_add_event(event),
+            Event::Remove(event) => self.handle_remove_event(event),
             Event::Work { tab, stamp, event } => self.handle_work_event(tab, stamp, event),
         }
     }
@@ -517,8 +526,33 @@ impl FacetApp {
                 if tab.is_ready() {
                     // A refresh failed: keep showing the last known state.
                     self.error_toast(title, detail);
+                    return;
+                }
+                let path = tab.path.clone();
+                self.remove_tab(index);
+                // A recent entry that can't be opened any more: offer to drop it right here.
+                let stale = matches!(
+                    error,
+                    GitError::PathNotFound { .. } | GitError::NotARepository { .. }
+                );
+                if stale
+                    && self
+                        .settings
+                        .recent_repos
+                        .iter()
+                        .any(|p| same_path(p, &path))
+                {
+                    self.offer_toast(
+                        ToastKind::Error,
+                        title,
+                        detail,
+                        vec![(
+                            "Remove from Recent".to_owned(),
+                            Action::RemoveRepository(path),
+                        )],
+                    );
+                    self.check_recent_health(true);
                 } else {
-                    self.remove_tab(index);
                     self.error_toast(title, detail);
                 }
             }
@@ -616,12 +650,10 @@ impl FacetApp {
     }
 
     /// Perform one action. Actions that do not apply in the current state are ignored.
-    pub fn run(&mut self, action: Action) {
-        match action {
+    pub fn run(&mut self, action: Action) {        match action {
             Action::ShowPalette => self.palette.toggle(),
             Action::OpenRepository => self.pick_repository(),
             Action::OpenPath(path) => self.open_path(path, true),
-            Action::ForgetRecent(path) => self.settings.forget_recent(&path),
             Action::CloseTab(index) => self.remove_tab(index),
             Action::CloseActiveTab => {
                 if let Some(index) = self.active {
@@ -680,6 +712,7 @@ impl FacetApp {
                 let unhandled = self
                     .run_settings_action(work)
                     .and_then(|other| self.run_add_action(other))
+                    .and_then(|other| self.run_remove_action(other))
                     .and_then(|other| self.run_work_action(other))
                     .and_then(|other| self.run_repo_action(other))
                     .and_then(|other| self.run_power_action(other))
@@ -726,17 +759,32 @@ impl FacetApp {
     pub fn action_toast(&mut self, title: impl Into<String>, button: &str, action: Action) {
         // Only the newest offer stays valid: an older "Undo" would act on the wrong entry.
         for toast in &mut self.toasts {
-            if toast.action.is_some() {
+            if !toast.actions.is_empty() {
                 toast.dismiss();
             }
         }
         self.push_toast(ToastKind::Info, title.into(), None);
         if let Some(toast) = self.toasts.last_mut() {
-            toast.action = Some((button.to_owned(), action));
+            toast.actions = vec![(button.to_owned(), action)];
         }
     }
 
-    fn push_toast(&mut self, kind: ToastKind, title: String, detail: Option<String>) {
+    /// A toast with buttons that carry everything they act on, so older offers stay valid
+    /// (unlike [`Self::action_toast`]'s undo of the latest entry).
+    pub(crate) fn offer_toast(
+        &mut self,
+        kind: ToastKind,
+        title: String,
+        detail: Option<String>,
+        actions: Vec<(String, Action)>,
+    ) {
+        self.push_toast(kind, title, detail);
+        if let Some(toast) = self.toasts.last_mut() {
+            toast.actions = actions;
+        }
+    }
+
+    pub(crate) fn push_toast(&mut self, kind: ToastKind, title: String, detail: Option<String>) {
         let id = self.next_toast_id;
         self.next_toast_id += 1;
         // Repeating the same message replaces the old toast instead of stacking.
@@ -766,6 +814,7 @@ impl FacetApp {
         if self.confirm.is_some()
             || self.prompt.is_some()
             || self.add_view.is_some()
+            || self.remove_view.is_some()
             || self.power_modal_open()
         {
             return;
@@ -950,6 +999,8 @@ impl FacetApp {
             }
         }
         if focused && !self.was_focused {
+            // Folders may have been deleted or moved while Facet was in the background.
+            self.check_recent_health(true);
             if let Some(index) = self.active.filter(|i| self.tabs[*i].is_ready()) {
                 if self.active_work().is_some() {
                     self.request_status(index, false);
@@ -1165,6 +1216,7 @@ impl FacetApp {
 impl eframe::App for FacetApp {
     fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
+        self.check_recent_health(false);
         self.persist_settings();
     }
 
@@ -1294,7 +1346,7 @@ pub(crate) fn describe_error(error: &GitError) -> (String, Option<String>) {
     }
 }
 
-fn display_name(path: &Path) -> String {
+pub(crate) fn display_name(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())

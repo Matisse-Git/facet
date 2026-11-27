@@ -520,8 +520,19 @@ impl Settings {
         self.recent_repos.truncate(MAX_RECENT);
     }
 
-    pub fn forget_recent(&mut self, path: &Path) {
+    /// Drop `path` from the recent list. Returns where it was, for [`Self::restore_recent`].
+    pub fn forget_recent(&mut self, path: &Path) -> Option<usize> {
+        let index = self.recent_repos.iter().position(|p| same_path(p, path));
         self.recent_repos.retain(|p| !same_path(p, path));
+        index
+    }
+
+    /// Put `path` back at `index` of the recent list (undo of [`Self::forget_recent`]).
+    pub fn restore_recent(&mut self, path: &Path, index: usize) {
+        self.recent_repos.retain(|p| !same_path(p, path));
+        let index = index.min(self.recent_repos.len());
+        self.recent_repos.insert(index, path.to_owned());
+        self.recent_repos.truncate(MAX_RECENT);
     }
 }
 
@@ -706,5 +717,25 @@ mod tests {
 
         settings.forget_recent(Path::new(r"D:\REPO\n39"));
         assert_eq!(settings.recent_repos[0], PathBuf::from(r"D:\Repo\N38"));
+    }
+
+    #[test]
+    fn a_forgotten_recent_goes_back_where_it_was() {
+        let mut settings = Settings::default();
+        for name in ["C", "B", "A"] {
+            settings.touch_recent(Path::new(&format!(r"D:\Repo\{name}")));
+        }
+        let index = settings.forget_recent(Path::new(r"d:\repo\b")).unwrap();
+        assert_eq!(index, 1);
+        assert_eq!(settings.forget_recent(Path::new(r"D:\Repo\Missing")), None);
+        settings.restore_recent(Path::new(r"D:\Repo\B"), index);
+        assert_eq!(
+            settings.recent_repos,
+            [r"D:\Repo\A", r"D:\Repo\B", r"D:\Repo\C"].map(PathBuf::from)
+        );
+        // An index past the end (the list shrank meanwhile) appends.
+        settings.forget_recent(Path::new(r"D:\Repo\C"));
+        settings.restore_recent(Path::new(r"D:\Repo\C"), 9);
+        assert_eq!(settings.recent_repos[2], PathBuf::from(r"D:\Repo\C"));
     }
 }

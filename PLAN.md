@@ -456,6 +456,20 @@ milestone ships.
     package` writes the MSIX layout, manifest and logos from the same icon code, then calls
     `makeappx`. The package is unsigned; the publisher name is a parameter so the owner's
     certificate subject can be used without code changes.
+42. **Removing a repository takes it off Facet's lists; its folder only ever goes to the Recycle
+    Bin** (`app_remove.rs`): the switcher's and welcome's hover × remove at once with an Undo
+    toast (recent position and tab restored); "Remove Repository…" (palette, repo-button menu,
+    welcome right-click, the toast's "Move to Recycle Bin…") opens a dialog whose unticked-by-
+    default box also recycles the folder. Before that, `removal_check` (facet-git) lists what
+    exists only there — changed/untracked files, unpushed commits per branch (one `rev-list
+    --parents --branches --not --remotes`, G5), stashes, no remote — and the button turns red
+    ("anyway") but is never blocked. A main worktree with linked worktrees cannot be recycled; a
+    linked one can, and `worktree prune` runs on its main repo after. The move is
+    `IFileOperation` with `FOFX_RECYCLEONDELETE` on an STA thread, and a progress sink aborts in
+    `PreDeleteItem` unless Windows reports `TSF_DELETE_RECYCLE_IF_POSSIBLE`, so a permanent
+    delete is refused (`RecycleError::WouldDelete`) rather than performed. Tabs are closed first
+    (G32). Recent rows whose folder is missing or not a repository are marked (checked off the UI
+    thread, again on focus regain), and a failed open of a recent offers "Remove from Recent".
 
 ## Module map
 
@@ -496,6 +510,8 @@ crates/facet-git/
                               unlock (force), track, pull; LfsAttr, Lock
   src/submodule.rs            submodules (.gitmodules + gitlinks), update, sync, submodule_range
   src/worktree.rs             worktrees, add (existing / new branch), remove (never forced), prune
+  src/removal.rs              removal_check: what exists only in a folder before it is recycled
+                              (changes, unpushed per branch, stashes, remote, worktrees)
   src/parse/mod.rs            shared helpers (utf8)
   src/parse/commit.rs         COMMIT_SUMMARY_FORMAT, CommitSummary, parse_commit_summary
   src/parse/status.rs         porcelain v2 -z parser
@@ -522,6 +538,7 @@ crates/facet-git/
                               file history, blame, reflog, external tools
   tests/branches.rs           branches, tags, switch, remotes, fetch/pull/push, stash (bare remotes)
   tests/askpass.rs            askpass pipe protocol, token check
+  tests/removal.rs            removal_check: no remote, local work, worktrees, non-roots, bare
   tests/status.rs             status: renames, unicode, spaces, conflicts, submodules, unborn
   tests/staging.rs            file/hunk/line stage + unstage, CRLF, no-EOL, new/deleted, binary
   tests/commit.rs             commit, amend, hooks (output surfaced, failure reported)
@@ -556,6 +573,8 @@ crates/facet/
                               conflict resolver, external tools, PowerEvent handling
   src/app_trees.rs            M4: worktrees, submodules, LFS (attributes, locks, track, pull)
   src/app_add.rs              Add repository: clone (progress, cancel, cleanup) / init / open
+  src/app_remove.rs           Remove repository: forget + undo, dialog state, Recycle Bin move,
+                              worktree prune, recent health (missing / not a repository)
   src/app_settings.rs         M4: settings view state + actions, git path check, UI scale, code
                               font, open in, tool presets, .gitignore templates, forwarded paths
   src/integrations.rs         detect Windows Terminal / VS Code / Rider / tools; launch them
@@ -581,6 +600,7 @@ crates/facet/
   src/icon_art.rs             procedural icon drawing, shared with build.rs and facet-bench
   src/platform/windows.rs     Chrome (subclass, Mica, caption, placement), folder picker, Explorer,
                               heap compaction (`compact_heap` / `release_free_memory`)
+  src/platform/recycle.rs     move_to_recycle_bin: IFileOperation, refuses a permanent delete
   src/ui/mod.rs               frame layout, splitters, drop overlay
   src/ui/widgets.rs           buttons, icon buttons, elided text, skeleton, hairlines, tooltips
   src/ui/titlebar.rs          app mark, repo switcher flyout (open + recent repos, Add), branch
@@ -601,9 +621,10 @@ crates/facet/
   src/ui/diff.rs              diff pane: header actions, virtualized text diff, gutter, selection
   src/ui/image_diff.rs        side by side / swipe / onion skin, checkerboard
   src/ui/confirm.rs           modal confirm dialog for destructive actions
+  src/ui/remove_repo.rs       Remove Repository dialog (Recycle Bin box, what would be lost)
   src/ui/command_log.rs       command log panel
   src/ui/palette.rs           command palette
-  src/ui/toast.rs             toasts
+  src/ui/toast.rs             toasts (one action inline beside the title; several in a row below)
 ```
 
 ## Where the remaining SPEC features land
@@ -778,6 +799,13 @@ M4-specific:
   error line (and a toast when the refresh was asked for).
 - Open In detects well-known install folders and `PATH` only (no registry): Rider or VS Code
   installed somewhere custom is not offered (the settings view says what was found).
+- **Remove repository:** the refusal of a permanent delete (`RecycleError::WouldDelete`) is not
+  exercised. It needs a drive without a Recycle Bin or a folder over the bin's size limit. A
+  real recycle is covered by an `#[ignore]` test in `platform/recycle.rs` and was checked in the
+  app with an isolated `FACET_CONFIG_DIR`, along with: × in the switcher and on the welcome
+  screen, broken-row labels, Undo (recent position and reopened tab), the two-button toast and
+  the dialog's warnings. Not clicked: recycling a linked worktree (the prune afterwards), the
+  "Remove from Recent" offer on a failed open, light theme.
 
 Carried over from M3:
 

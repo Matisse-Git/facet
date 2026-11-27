@@ -9,6 +9,7 @@ mod actions;
 mod app;
 mod app_add;
 mod app_power;
+mod app_remove;
 mod app_repo;
 mod app_settings;
 mod app_trees;
